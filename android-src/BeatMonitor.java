@@ -39,11 +39,21 @@ final class BeatMonitor {
         try { return mp != null && mp.isPlaying(); } catch (Exception e) { return false; }
     }
 
+    private volatile boolean loopWanted;
+    private volatile int completions;
+    private volatile String lastError = "";
+
+    int completions() { return completions; }
+    String lastError() { return lastError; }
+
     void start(String url, int fromMs, boolean loop, Integer outputDeviceId, AudioManager am, final ReadyCallback cb) {
         stop();
         final MediaPlayer p = new MediaPlayer();
         this.mp = p;
         this.prepared = false;
+        this.loopWanted = loop;
+        this.completions = 0;
+        this.lastError = "";
         final int seekTo = Math.max(0, fromMs);
         try {
             p.setAudioAttributes(new AudioAttributes.Builder()
@@ -57,8 +67,22 @@ final class BeatMonitor {
                 if (dev != null) p.setPreferredDevice(dev);
             }
             p.setOnErrorListener((m, what, extra) -> {
-                cb.onReady(false, "MediaPlayer error " + what + "/" + extra);
+                lastError = "err " + what + "/" + extra;
+                if (!prepared) { cb.onReady(false, "MediaPlayer error " + what + "/" + extra); return true; }
+                // mid-playback error - try to recover so the beat keeps going
+                try { m.reset(); m.setDataSource(url); m.setLooping(loopWanted); m.prepare(); m.start(); }
+                catch (Exception e) { lastError = "recover failed: " + e.getMessage(); }
                 return true;
+            });
+            // setLooping should handle it, but on some devices / WAVs it silently
+            // stops at EOF - manual restart is the backstop (with looping on,
+            // onCompletion normally never fires, so this is harmless when it works)
+            p.setOnCompletionListener(m -> {
+                completions++;
+                lastError = "completion #" + completions;
+                if (loopWanted) {
+                    try { m.seekTo(0); m.start(); } catch (Exception e) { lastError = "loop restart failed: " + e.getMessage(); }
+                }
             });
             p.setOnPreparedListener(m -> {
                 prepared = true;

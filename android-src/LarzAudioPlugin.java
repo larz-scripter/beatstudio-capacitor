@@ -356,6 +356,8 @@ public class LarzAudioPlugin extends Plugin {
         JSObject r = new JSObject();
         r.put("ms", beatMonitor != null ? beatMonitor.positionMs() : -1);
         r.put("playing", beatMonitor != null && beatMonitor.isPlaying());
+        r.put("completions", beatMonitor != null ? beatMonitor.completions() : 0);
+        r.put("lastError", beatMonitor != null ? beatMonitor.lastError() : "");
         call.resolve(r);
     }
 
