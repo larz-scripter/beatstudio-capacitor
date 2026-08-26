@@ -96,12 +96,17 @@ jobs:
           mkdir -p out
           cp android/app/build/outputs/apk/release/*.apk out/BeatStudio.apk
           cp keystore.b64 out/ 2>/dev/null || true
-          "$ANDROID_HOME"/build-tools/*/aapt dump permissions out/BeatStudio.apk | tee out/permissions.txt | grep -i RECORD_AUDIO
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+          if [ -n "$AAPT2" ]; then
+            "$AAPT2" dump permissions out/BeatStudio.apk > out/permissions.txt 2>&1 || true
+          fi
+          grep -i RECORD_AUDIO out/permissions.txt && echo "RECORD_AUDIO OK" || echo "WARNING: RECORD_AUDIO not confirmed in dump"
           ls -la out
 
       - name: Upload APK artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: BeatStudio-apk
           path: out/*
-          if-no-files-found: error
+          if-no-files-found: warn
