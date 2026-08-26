@@ -13,7 +13,8 @@ pkg_dir = os.path.dirname(matches[0])
 src = open(matches[0]).read()
 pkg = re.search(r"package\s+([\w.]+);", src).group(1)
 
-SOURCES = ["LarzAudioPlugin.java", "AudioDeviceCatalog.java", "PcmWavRecorder.java", "BeatMonitor.java"]
+SOURCES = ["LarzAudioPlugin.java", "AudioDeviceCatalog.java", "PcmWavRecorder.java",
+           "BeatMonitor.java", "LocalFileServer.java"]
 for name in SOURCES:
     srcpath = os.path.join("android-src", name)
     if not os.path.isfile(srcpath):

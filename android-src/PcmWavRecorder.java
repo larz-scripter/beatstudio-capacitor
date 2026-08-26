@@ -7,10 +7,8 @@ import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.os.Build;
-import android.util.Base64;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 
@@ -31,10 +29,13 @@ final class PcmWavRecorder {
 
     interface LevelListener { void onLevel(double rms); }
 
-    static final int MAX_SECONDS = 120; // native single-take cap (see README)
+    static final int MAX_SECONDS = 600; // native single-take cap - the take is served
+                                        // over a loopback socket, not base64, so this
+                                        // can be generous (covers any song length)
 
     static final class Result {
-        String base64 = "";
+        File file;                 // the finished WAV (caller/local server owns it)
+        String base64 = "";        // populated only for the legacy small-take path
         long durationMs;
         int sampleRate;
         int channels;
@@ -192,10 +193,12 @@ final class PcmWavRecorder {
         out.durationMs = dataBytes * 1000L / (long) (sampleRate * channels * 2);
         out.firstFrameLatencyMs = firstFrameNanos > 0 ? (firstFrameNanos - startNanos) / 1_000_000L : 0;
 
+        // Hand the finished WAV file to the caller; it is served over a loopback
+        // socket and deleted afterwards. No base64 (a full-song take is tens of MB
+        // and must not go through the Capacitor message bridge).
         if (wav != null && wav.exists() && wav.length() > 44) {
-            out.base64 = Base64.encodeToString(readAll(wav), Base64.NO_WRAP);
+            out.file = wav;
         }
-        deleteTemp();
         return out;
     }
 
@@ -267,15 +270,6 @@ final class PcmWavRecorder {
 
     private static void writeLE16(RandomAccessFile raf, int v) throws IOException {
         raf.write(v & 0xff); raf.write((v >> 8) & 0xff);
-    }
-
-    private static byte[] readAll(File f) throws IOException {
-        byte[] data = new byte[(int) f.length()];
-        try (FileInputStream in = new FileInputStream(f)) {
-            int off = 0, r;
-            while (off < data.length && (r = in.read(data, off, data.length - off)) > 0) off += r;
-        }
-        return data;
     }
 
     private static int clampSampleRate(int sr) {

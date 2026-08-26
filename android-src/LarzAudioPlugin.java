@@ -46,6 +46,7 @@ public class LarzAudioPlugin extends Plugin {
 
     private PcmWavRecorder recorder;
     private BeatMonitor beatMonitor;
+    private LocalFileServer takeServer;
     private long captureStartedAt;
 
     private void step(String stepName, JSObject data) {
@@ -173,7 +174,6 @@ public class LarzAudioPlugin extends Plugin {
             recorder = null;
 
             JSObject ret = new JSObject();
-            ret.put("base64", r.base64);
             ret.put("mimeType", "audio/wav");
             ret.put("durationMs", r.durationMs);
             ret.put("sampleRate", r.sampleRate);
@@ -184,9 +184,22 @@ public class LarzAudioPlugin extends Plugin {
             ret.put("device", r.device);
             ret.put("wallClockMs", System.currentTimeMillis() - captureStartedAt);
 
+            long bytes = 0;
+            String url = "";
+            if (r.file != null && r.file.exists()) {
+                bytes = r.file.length();
+                if (takeServer != null) takeServer.stop();
+                takeServer = new LocalFileServer();
+                int port = takeServer.start(r.file, "audio/wav");
+                url = "http://127.0.0.1:" + port + "/take.wav";
+            }
+            ret.put("url", url);
+            ret.put("bytes", bytes);
+
             JSObject logData = new JSObject();
             logData.put("durationMs", r.durationMs);
-            logData.put("base64Len", r.base64.length());
+            logData.put("bytes", bytes);
+            logData.put("url", url);
             logData.put("firstFrameLatencyMs", r.firstFrameLatencyMs);
             logData.put("truncated", r.truncated);
             logData.put("source", r.source);
@@ -198,6 +211,13 @@ public class LarzAudioPlugin extends Plugin {
             recorder = null;
             call.reject("stopCapture failed: " + e.getMessage(), e);
         }
+    }
+
+    @PluginMethod
+    public void releaseTake(PluginCall call) {
+        if (takeServer != null) { takeServer.stop(); takeServer = null; }
+        step("releaseTake", null);
+        call.resolve();
     }
 
     @PluginMethod
@@ -321,6 +341,10 @@ public class LarzAudioPlugin extends Plugin {
         if (beatMonitor != null) {
             try { beatMonitor.stop(); } catch (Throwable ignored) {}
             beatMonitor = null;
+        }
+        if (takeServer != null) {
+            try { takeServer.stop(); } catch (Throwable ignored) {}
+            takeServer = null;
         }
         super.handleOnDestroy();
     }
