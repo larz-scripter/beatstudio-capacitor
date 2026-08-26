@@ -213,6 +213,39 @@ public class LarzAudioPlugin extends Plugin {
     // ---- beat monitor (native MediaPlayer, routable output) ----
 
     @PluginMethod
+    public void prepareBeat(final PluginCall call) {
+        final String url = call.getString("url");
+        if (url == null || url.isEmpty()) { call.reject("url required"); return; }
+        final java.io.File out = BeatMonitor.cachedFileFor(getContext(), url);
+        if (out.exists() && out.length() > 0) {
+            JSObject r = new JSObject();
+            r.put("localPath", out.getAbsolutePath());
+            r.put("cached", true);
+            r.put("bytes", out.length());
+            call.resolve(r);
+            return;
+        }
+        JSObject dl = new JSObject();
+        dl.put("url", url);
+        step("prepareBeat:downloading", dl);
+        new Thread(() -> {
+            try {
+                BeatMonitor.download(url, out);
+                JSObject r = new JSObject();
+                r.put("localPath", out.getAbsolutePath());
+                r.put("cached", false);
+                r.put("bytes", out.length());
+                step("prepareBeat:done", r);
+                call.resolve(r);
+            } catch (Exception e) {
+                try { if (out.exists()) out.delete(); } catch (Exception ex) {}
+                stepErr("prepareBeat", e);
+                call.reject("prepareBeat failed: " + e.getMessage(), e);
+            }
+        }, "bs-beat-prefetch").start();
+    }
+
+    @PluginMethod
     public void startBeatMonitor(final PluginCall call) {
         final String url = call.getString("url");
         if (url == null || url.isEmpty()) { call.reject("url required"); return; }
