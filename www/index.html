@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BeatStudio</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{background:#0b0f1a;color:#e8edf5;font-family:system-ui,Segoe UI,Arial,sans-serif;
+       display:grid;place-items:center;text-align:center;padding:24px}
+  .logo{font-size:1.8rem;font-weight:800;letter-spacing:-.02em}
+  .logo b{color:#00c896}
+  .sub{color:#8b98a9;margin-top:.4rem}
+  .spin{margin-top:1.4rem;width:34px;height:34px;border:3px solid #26303d;border-top-color:#00c896;
+        border-radius:50%;animation:s 1s linear infinite;display:inline-block}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+  <div>
+    <div class="logo">Beat<b>Studio</b></div>
+    <div class="sub">Loading…</div>
+    <div class="spin"></div>
+  </div>
+  <!-- Fallback only. The app loads https://larzos.com/beatstudio/ via capacitor.config server.url. -->
+</body>
+</html>

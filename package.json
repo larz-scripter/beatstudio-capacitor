@@ -1,0 +1,20 @@
+{
+  "name": "beatstudio-capacitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BeatStudio native Android app (Capacitor) - loads larzos.com/beatstudio/ with a native audio connector: enumerates every mic / USB audio interface and captures the chosen device directly via AudioRecord, so recording and beat playback stay on separate devices.",
+  "scripts": {
+    "build:android": "npx cap sync android && cd android && ./gradlew assembleRelease"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.0.0",
+    "@capacitor/assets": "^3.0.5"
+  },
+  "dependencies": {
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/app": "^7.0.0",
+    "@capacitor/splash-screen": "^7.0.0",
+    "@capacitor/status-bar": "^7.0.0"
+  }
+}

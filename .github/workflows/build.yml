@@ -1,0 +1,107 @@
+name: Build BeatStudio APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+      KEY_PASS: ${{ secrets.KEY_PASS }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Default the signing env (only if secrets are unset)
+        run: |
+          echo "KEYSTORE_PASS=${KEYSTORE_PASS:-beatstudio}" >> $GITHUB_ENV
+          echo "KEY_PASS=${KEY_PASS:-beatstudio}"           >> $GITHUB_ENV
+          echo "KEY_ALIAS=${KEY_ALIAS:-beatstudio}"         >> $GITHUB_ENV
+
+      - name: Install JS deps
+        run: npm install
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Generate launcher icon + splash
+        run: |
+          npx capacitor-assets generate --android \
+            --iconBackgroundColor '#0b0f1a' \
+            --iconBackgroundColorDark '#0b0f1a' \
+            --splashBackgroundColor '#0b0f1a' \
+            --splashBackgroundColorDark '#0b0f1a' || echo "assets step skipped (no source images)"
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Inject the LarzAudio native plugin
+        run: |
+          set -e
+          python3 scripts/inject_audio_plugin.py
+          python3 scripts/patch_gradle.py
+          python3 scripts/patch_mainactivity.py
+          echo "---- MainActivity.java ----"
+          find android/app/src/main/java -name MainActivity.java -exec cat {} \;
+          echo "---- plugin sources present ----"
+          find android/app/src/main/java -name 'LarzAudio*.java' -o -name 'AudioDeviceCatalog.java' -o -name 'PcmWavRecorder.java'
+          echo "---- AndroidManifest.xml ----"
+          cat android/app/src/main/AndroidManifest.xml
+          echo "---- build.gradle (android block) ----"
+          sed -n '/^android {/,/^}/p' android/app/build.gradle | head -60
+
+      - name: Restore or create signing keystore
+        run: |
+          set -e
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            echo "Restoring persistent keystore from secret"
+            echo "$ANDROID_KEYSTORE_B64" | base64 -d > android/app/release.keystore
+          else
+            echo "No ANDROID_KEYSTORE_B64 secret -> generating a NEW keystore"
+            keytool -genkeypair \
+              -keystore android/app/release.keystore \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KEYSTORE_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=BeatStudio, O=Larz OS, L=Lagos, C=NG"
+          fi
+          base64 -w0 android/app/release.keystore > keystore.b64
+          keytool -list -v -keystore android/app/release.keystore -alias "$KEY_ALIAS" \
+            -storepass "$KEYSTORE_PASS" | grep -i 'SHA' || true
+
+      - name: Build signed release APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace --no-daemon
+
+      - name: Stage outputs
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/release/*.apk out/BeatStudio.apk
+          cp keystore.b64 out/ 2>/dev/null || true
+          "$ANDROID_HOME"/build-tools/*/aapt dump permissions out/BeatStudio.apk | tee out/permissions.txt | grep -i RECORD_AUDIO
+          ls -la out
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeatStudio-apk
+          path: out/*
+          if-no-files-found: error
