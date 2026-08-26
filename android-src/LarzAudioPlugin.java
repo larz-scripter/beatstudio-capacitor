@@ -186,20 +186,29 @@ public class LarzAudioPlugin extends Plugin {
 
             long bytes = 0;
             String url = "";
+            String b64 = "";
             if (r.file != null && r.file.exists()) {
                 bytes = r.file.length();
                 if (takeServer != null) takeServer.stop();
                 takeServer = new LocalFileServer();
                 int port = takeServer.start(r.file, "audio/wav");
                 url = "http://127.0.0.1:" + port + "/take.wav";
+                // safety net for takes small enough to survive the bridge: also
+                // hand back base64 so a blocked loopback fetch never loses a take
+                if (bytes > 0 && bytes <= 12_000_000L) {
+                    try { b64 = android.util.Base64.encodeToString(LocalFileServer.readAll(r.file), android.util.Base64.NO_WRAP); }
+                    catch (Exception ignored) {}
+                }
             }
             ret.put("url", url);
+            ret.put("base64", b64);
             ret.put("bytes", bytes);
 
             JSObject logData = new JSObject();
             logData.put("durationMs", r.durationMs);
             logData.put("bytes", bytes);
             logData.put("url", url);
+            logData.put("base64Len", b64.length());
             logData.put("firstFrameLatencyMs", r.firstFrameLatencyMs);
             logData.put("truncated", r.truncated);
             logData.put("source", r.source);

@@ -122,4 +122,13 @@ final class LocalFileServer {
         }
         port = -1;
     }
+
+    static byte[] readAll(File f) throws IOException {
+        byte[] data = new byte[(int) f.length()];
+        try (FileInputStream in = new FileInputStream(f)) {
+            int off = 0, n;
+            while (off < data.length && (n = in.read(data, off, data.length - off)) > 0) off += n;
+        }
+        return data;
+    }
 }
