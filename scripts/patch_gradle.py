@@ -3,18 +3,28 @@
 - bump versionCode / versionName
 - add a release signingConfig that reads the keystore + passwords from env
 - apply that signingConfig to the release build type
-- raise minSdk to 24 (AudioSource.UNPROCESSED; USB audio is reliable well below this)
+- raise minSdk to 28 (MediaPlayer.setPreferredDevice for the routable beat monitor)
 Run after `npx cap add android`.
 """
+import os
 import re
+
+# Capacitor 7 keeps SDK levels in android/variables.gradle - bump minSdk there.
+V = "android/variables.gradle"
+if os.path.isfile(V):
+    vs = open(V).read()
+    vs2 = re.sub(r"minSdkVersion\s*=\s*\d+", "minSdkVersion = 28", vs)
+    if vs2 != vs:
+        open(V, "w").write(vs2)
+        print("patched android/variables.gradle (minSdkVersion = 28)")
 
 P = "android/app/build.gradle"
 s = open(P).read()
 
-s = re.sub(r"versionCode\s+\d+", "versionCode 1", s, count=1)
-s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.0"', s, count=1)
-s = re.sub(r"minSdkVersion\s+rootProject\.ext\.minSdkVersion", "minSdkVersion 24", s, count=1)
-s = re.sub(r"minSdk\s+\d+", "minSdk 24", s, count=1)
+s = re.sub(r"versionCode\s+\d+", "versionCode 2", s, count=1)
+s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.1"', s, count=1)
+s = re.sub(r"minSdkVersion\s+rootProject\.ext\.minSdkVersion", "minSdkVersion 28", s, count=1)
+s = re.sub(r"minSdk\s+\d+", "minSdk 28", s, count=1)
 
 SIGN = """
     signingConfigs {
@@ -34,4 +44,4 @@ s = re.sub(r"(buildTypes\s*\{\s*release\s*\{)",
            s, count=1)
 
 open(P, "w").write(s)
-print("patched android/app/build.gradle (version + signing + minSdk 24)")
+print("patched android/app/build.gradle (version + signing + minSdk 28)")

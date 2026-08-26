@@ -45,6 +45,7 @@ public class LarzAudioPlugin extends Plugin {
     static final String TAG = "BeatStudioAudio";
 
     private PcmWavRecorder recorder;
+    private BeatMonitor beatMonitor;
     private long captureStartedAt;
 
     private void step(String stepName, JSObject data) {
@@ -209,11 +210,84 @@ public class LarzAudioPlugin extends Plugin {
         call.resolve();
     }
 
+    // ---- beat monitor (native MediaPlayer, routable output) ----
+
+    @PluginMethod
+    public void startBeatMonitor(final PluginCall call) {
+        final String url = call.getString("url");
+        if (url == null || url.isEmpty()) { call.reject("url required"); return; }
+        final int fromMs = call.getInt("fromMs", 0);
+        Boolean loopB = call.getBoolean("loop", Boolean.TRUE);
+        final boolean loop = loopB == null || loopB;
+        final Integer outId = call.getInt("outputDeviceId");
+        final AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+        if (beatMonitor == null) beatMonitor = new BeatMonitor(getContext());
+
+        JSObject pre = new JSObject();
+        pre.put("fromMs", fromMs);
+        pre.put("loop", loop);
+        pre.put("outputDeviceId", outId == null ? "default" : outId);
+        pre.put("url", url);
+        step("startBeatMonitor:call", pre);
+
+        beatMonitor.start(url, fromMs, loop, outId, am, (ok, err) -> {
+            if (ok) {
+                JSObject r = new JSObject();
+                r.put("playing", true);
+                r.put("positionMs", beatMonitor.positionMs());
+                step("startBeatMonitor:playing", r);
+                call.resolve(r);
+            } else {
+                JSObject fail = new JSObject();
+                fail.put("error", err);
+                step("startBeatMonitor:failed", fail);
+                call.reject("beat monitor failed: " + err);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void stopBeatMonitor(PluginCall call) {
+        if (beatMonitor != null) beatMonitor.stop();
+        step("stopBeatMonitor", null);
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void getBeatMonitorPosition(PluginCall call) {
+        JSObject r = new JSObject();
+        r.put("ms", beatMonitor != null ? beatMonitor.positionMs() : -1);
+        r.put("playing", beatMonitor != null && beatMonitor.isPlaying());
+        call.resolve(r);
+    }
+
+    @PluginMethod
+    public void seekBeatMonitor(PluginCall call) {
+        if (beatMonitor != null) beatMonitor.seek(call.getInt("ms", 0));
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void setMonitorOutput(PluginCall call) {
+        Integer outId = call.getInt("outputDeviceId");
+        AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+        String result = (beatMonitor != null) ? beatMonitor.setOutput(outId, am) : "no monitor running";
+        JSObject r = new JSObject();
+        r.put("outputDeviceId", outId == null ? "default" : outId);
+        r.put("result", result);
+        step("setMonitorOutput", r);
+        call.resolve(r);
+    }
+
     @Override
     protected void handleOnDestroy() {
         if (recorder != null) {
             try { recorder.cancel(); } catch (Throwable ignored) {}
             recorder = null;
+        }
+        if (beatMonitor != null) {
+            try { beatMonitor.stop(); } catch (Throwable ignored) {}
+            beatMonitor = null;
         }
         super.handleOnDestroy();
     }
