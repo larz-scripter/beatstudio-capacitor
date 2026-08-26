@@ -83,9 +83,9 @@ public class LarzAudioPlugin extends Plugin {
             step("listDevices", logData);
             Log.d(TAG, "listDevices full: " + ret.toString());
             call.resolve(ret);
-        } catch (Throwable t) {
-            stepErr("listDevices", t);
-            call.reject("listDevices failed: " + t.getMessage(), t);
+        } catch (Exception e) {
+            stepErr("listDevices", e);
+            call.reject("listDevices failed: " + e.getMessage(), e);
         }
     }
 
@@ -152,10 +152,10 @@ public class LarzAudioPlugin extends Plugin {
             ret.put("device", recorder.getActiveDeviceLabel());
             step("startCapture:started", ret);
             call.resolve(ret);
-        } catch (Throwable t) {
-            stepErr("startCapture", t);
+        } catch (Exception e) {
+            stepErr("startCapture", e);
             recorder = null;
-            call.reject("startCapture failed: " + t.getMessage(), t);
+            call.reject("startCapture failed: " + e.getMessage(), e);
         }
     }
 
@@ -192,10 +192,10 @@ public class LarzAudioPlugin extends Plugin {
             logData.put("device", r.device);
             step("stopCapture:done", logData);
             call.resolve(ret);
-        } catch (Throwable t) {
-            stepErr("stopCapture", t);
+        } catch (Exception e) {
+            stepErr("stopCapture", e);
             recorder = null;
-            call.reject("stopCapture failed: " + t.getMessage(), t);
+            call.reject("stopCapture failed: " + e.getMessage(), e);
         }
     }
 
