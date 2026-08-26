@@ -222,6 +222,42 @@ public class LarzAudioPlugin extends Plugin {
         }
     }
 
+    // Chunked base64 fallback for when the loopback socket is blocked and the
+    // take is too big for a single base64 payload. Reads the finished WAV file
+    // the takeServer still holds, `size` bytes at a time.
+    @PluginMethod
+    public void getTakeChunk(PluginCall call) {
+        try {
+            java.io.File f = (takeServer != null) ? takeServer.getFile() : null;
+            if (f == null || !f.exists()) { call.reject("no take file"); return; }
+            int index = call.getInt("index", 0);
+            int size = call.getInt("size", 3_000_000);
+            if (size < 1 || size > 8_000_000) size = 3_000_000;
+            long off = (long) index * (long) size;
+            long flen = f.length();
+            JSObject r = new JSObject();
+            if (off >= flen) {
+                r.put("base64", "");
+                r.put("eof", true);
+                call.resolve(r);
+                return;
+            }
+            int n = (int) Math.min((long) size, flen - off);
+            byte[] buf = new byte[n];
+            try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r")) {
+                raf.seek(off);
+                raf.readFully(buf);
+            }
+            r.put("base64", android.util.Base64.encodeToString(buf, android.util.Base64.NO_WRAP));
+            r.put("index", index);
+            r.put("bytes", n);
+            r.put("eof", off + n >= flen);
+            call.resolve(r);
+        } catch (Exception e) {
+            call.reject("getTakeChunk failed: " + e.getMessage(), e);
+        }
+    }
+
     @PluginMethod
     public void releaseTake(PluginCall call) {
         if (takeServer != null) { takeServer.stop(); takeServer = null; }

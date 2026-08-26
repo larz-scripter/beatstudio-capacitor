@@ -97,6 +97,39 @@ public class MainActivity extends BridgeActivity {
 open(path, "w").write(new)
 print("patched MainActivity (package " + pkg + ", registered LarzAudioPlugin)")
 
+# ------------------------------------------------- network security config
+# capacitor.config sets cleartext:false, which blocks ALL http:// including
+# 127.0.0.1 - the loopback socket that serves a full-length take. Allow
+# cleartext only for localhost.
+import glob as _glob
+import os
+LOCAL_CFG = (
+    '    <domain-config cleartextTrafficPermitted="true">\n'
+    '        <domain includeSubdomains="false">127.0.0.1</domain>\n'
+    '        <domain includeSubdomains="false">localhost</domain>\n'
+    '    </domain-config>\n'
+)
+nsc_dir = "android/app/src/main/res/xml"
+os.makedirs(nsc_dir, exist_ok=True)
+existing = _glob.glob("android/app/src/main/res/xml/*network*security*config*.xml") \
+    + _glob.glob("android/app/src/main/res/xml/network_security_config.xml")
+existing = sorted(set(existing))
+if existing:
+    for p in existing:
+        t = open(p).read()
+        if "127.0.0.1" not in t:
+            t = t.replace("</network-security-config>", LOCAL_CFG + "</network-security-config>")
+            open(p, "w").write(t)
+            print("merged localhost cleartext into " + os.path.basename(p))
+    nsc_name = os.path.splitext(os.path.basename(existing[0]))[0]
+else:
+    open(os.path.join(nsc_dir, "network_security_config.xml"), "w").write(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<network-security-config>\n' + LOCAL_CFG + '</network-security-config>\n'
+    )
+    nsc_name = "network_security_config"
+    print("wrote res/xml/network_security_config.xml")
+
 # --------------------------------------------------------------- Manifest
 mf = "android/app/src/main/AndroidManifest.xml"
 mtxt = open(mf).read()
@@ -111,7 +144,13 @@ if perms:
         raise SystemExit("no <manifest> tag in AndroidManifest.xml")
     at = m2.end()
     mtxt = mtxt[:at] + "\n" + perms + mtxt[at:]
-    open(mf, "w").write(mtxt)
     print("patched AndroidManifest (RECORD_AUDIO + MODIFY_AUDIO_SETTINGS)")
-else:
-    print("AndroidManifest already has the audio permissions")
+
+# point <application> at the network security config
+if "networkSecurityConfig" not in mtxt:
+    mtxt = re.sub(r"(<application\b)",
+                  r'\1 android:networkSecurityConfig="@xml/' + nsc_name + '"',
+                  mtxt, count=1)
+    print("patched AndroidManifest (networkSecurityConfig -> @xml/" + nsc_name + ")")
+
+open(mf, "w").write(mtxt)

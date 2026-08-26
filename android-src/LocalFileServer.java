@@ -41,6 +41,7 @@ final class LocalFileServer {
     }
 
     int getPort() { return port; }
+    File getFile() { return file; }
 
     private void loop() {
         ServerSocket s = socket;
