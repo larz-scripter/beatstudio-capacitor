@@ -48,6 +48,7 @@ public class LarzAudioPlugin extends Plugin {
     private BeatMonitor beatMonitor;
     private LocalFileServer takeServer;
     private long captureStartedAt;
+    private java.io.RandomAccessFile monitorMixRaf;   // chunked upload of the WebView-rendered monitor mix
 
     private void step(String stepName, JSObject data) {
         Log.d(TAG, stepName + (data != null ? " " + data.toString() : ""));
@@ -379,11 +380,77 @@ public class LarzAudioPlugin extends Plugin {
         call.resolve(r);
     }
 
+    // ---- local record-monitor mix (rendered in the WebView, written here) ----
+    //
+    // The page renders "beat + every recorded vocal, timeline-aligned" itself via
+    // an OfflineAudioContext (the same graph play/pause already uses) and streams
+    // the resulting WAV here in base64 chunks - same transport shape as
+    // getTakeChunk, just inbound. BeatMonitor then plays the finished local file.
+    // This replaces the server round-trip (upload every take -> /api/assemble ->
+    // poll) that the "Sync takes" button used to do: no network, no server, and
+    // one clock (what you hear while recording IS the play/pause mix).
+    @PluginMethod
+    public void saveMonitorMixChunk(PluginCall call) {
+        try {
+            Boolean probe = call.getBoolean("probe", Boolean.FALSE);
+            if (probe != null && probe) {
+                JSObject pr = new JSObject();
+                pr.put("supported", true);
+                call.resolve(pr);
+                return;
+            }
+            int index = call.getInt("index", 0);
+            String b64 = call.getString("base64", "");
+            Boolean eofB = call.getBoolean("eof", Boolean.FALSE);
+            boolean eof = eofB != null && eofB;
+            java.io.File dir = getContext().getCacheDir();
+            java.io.File part = new java.io.File(dir, "bs_monitor_mix.wav.part");
+
+            if (index == 0) {
+                if (monitorMixRaf != null) { try { monitorMixRaf.close(); } catch (Exception ignored) {} }
+                if (part.exists() && !part.delete()) { /* will be truncated below */ }
+                monitorMixRaf = new java.io.RandomAccessFile(part, "rw");
+                monitorMixRaf.setLength(0);
+            }
+            if (monitorMixRaf == null) { call.reject("send index 0 first"); return; }
+
+            if (b64 != null && !b64.isEmpty()) {
+                byte[] bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT);
+                monitorMixRaf.write(bytes);
+            }
+
+            JSObject r = new JSObject();
+            if (eof) {
+                monitorMixRaf.close();
+                monitorMixRaf = null;
+                java.io.File out = new java.io.File(dir, "bs_monitor_mix_" + System.currentTimeMillis() + ".wav");
+                if (!part.renameTo(out)) { call.reject("could not finalise monitor mix"); return; }
+                java.io.File[] olds = dir.listFiles((d, n) -> n.startsWith("bs_monitor_mix_") && n.endsWith(".wav"));
+                if (olds != null) for (java.io.File o : olds) { if (!o.equals(out)) { boolean ignored = o.delete(); } }
+                r.put("localPath", out.getAbsolutePath());
+                r.put("bytes", out.length());
+                step("saveMonitorMixChunk:done", r);
+            } else {
+                r.put("received", index);
+            }
+            call.resolve(r);
+        } catch (Exception e) {
+            stepErr("saveMonitorMixChunk", e);
+            try { if (monitorMixRaf != null) monitorMixRaf.close(); } catch (Exception ignored) {}
+            monitorMixRaf = null;
+            call.reject("saveMonitorMixChunk failed: " + e.getMessage(), e);
+        }
+    }
+
     @Override
     protected void handleOnDestroy() {
         if (recorder != null) {
             try { recorder.cancel(); } catch (Throwable ignored) {}
             recorder = null;
+        }
+        if (monitorMixRaf != null) {
+            try { monitorMixRaf.close(); } catch (Throwable ignored) {}
+            monitorMixRaf = null;
         }
         if (beatMonitor != null) {
             try { beatMonitor.stop(); } catch (Throwable ignored) {}
