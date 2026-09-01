@@ -3,120 +3,228 @@ package com.larzos.beatstudio;
 import android.content.Context;
 import android.media.AudioAttributes;
 import android.media.AudioDeviceInfo;
+import android.media.AudioFormat;
 import android.media.AudioManager;
-import android.media.MediaPlayer;
+import android.media.AudioTimestamp;
+import android.media.AudioTrack;
 import android.os.Build;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * Plays the beat for the performer during recording through a native
- * {@link MediaPlayer} bound to a chosen output device via
- * {@link MediaPlayer#setPreferredDevice}.
+ * Plays the beat / monitor bed for the performer during recording through a
+ * native {@link AudioTrack} in streaming mode, reading a local 16-bit PCM WAV.
  *
- * The WebView's own Web Audio output cannot be routed to a specific device on
- * Android - there is no setSinkId. Playing the beat natively is the only way to
- * give the performer a "listen from here" choice (Bluetooth / wired / speaker)
- * that is independent of what Android would pick for media by default, and
- * independent of the pinned USB/wired capture device.
+ * Why AudioTrack, not MediaPlayer (the v1.7 and earlier implementation):
+ *  - {@link AudioTrack#getPlaybackHeadPosition()} is a true hardware frame
+ *    counter: it advances at exactly the DAC rate and never freezes. The
+ *    song position a recorded take is anchored to is therefore
+ *    sample-accurate, and the bed the performer hears plays at exactly real
+ *    time - so a take no longer drifts off-beat over its length (the bug
+ *    users kept hitting: "on the beat while recording, off by the end").
+ *  - {@link AudioTrack#getTimestamp} ties a frame position to a
+ *    {@link System#nanoTime} instant (and accounts for output latency), which
+ *    the plugin uses to place the take at the exact song position that was
+ *    sounding when the mic captured its first sample.
+ *  - Reading a local file means no network buffering and none of MediaPlayer's
+ *    "position pinned at the seek target for seconds while it buffers".
+ *  - {@link AudioTrack#setPreferredDevice} still gives the routable-output
+ *    choice (Bluetooth / wired / speaker) the WebView's Web Audio cannot.
  */
 final class BeatMonitor {
 
     interface ReadyCallback { void onReady(boolean ok, String err); }
 
     private final Context ctx;
-    private MediaPlayer mp;
-    private volatile boolean prepared;
+
+    private volatile AudioTrack track;
+    private volatile Thread feeder;
+    private volatile boolean playing;
+    private volatile boolean stopRequested;
+    private volatile String lastError = "";
+    private volatile int completions;
+
+    private volatile int sampleRate = 48000;
+    private volatile int channels = 1;
+    private volatile long seekFrames = 0;
+    private volatile File srcFile;
+    private volatile boolean loopWanted;
+    private volatile Integer lastOutputDeviceId;
 
     BeatMonitor(Context ctx) { this.ctx = ctx; }
 
-    boolean isPlaying() {
-        try { return mp != null && mp.isPlaying(); } catch (Exception e) { return false; }
-    }
-
-    private volatile boolean loopWanted;
-    private volatile int completions;
-    private volatile String lastError = "";
-
+    boolean isPlaying() { return playing; }
     int completions() { return completions; }
     String lastError() { return lastError; }
 
-    void start(String url, int fromMs, boolean loop, Integer outputDeviceId, AudioManager am, final ReadyCallback cb) {
+    void start(final String url, final int fromMs, final boolean loop,
+               final Integer outputDeviceId, final AudioManager am, final ReadyCallback cb) {
         stop();
-        final MediaPlayer p = new MediaPlayer();
-        this.mp = p;
-        this.prepared = false;
+        this.stopRequested = false;
         this.loopWanted = loop;
         this.completions = 0;
         this.lastError = "";
-        final int seekTo = Math.max(0, fromMs);
-        try {
-            p.setAudioAttributes(new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build());
-            p.setDataSource(url);
-            p.setLooping(loop);
-            if (outputDeviceId != null && Build.VERSION.SDK_INT >= 28) {
-                AudioDeviceInfo dev = AudioDeviceCatalog.findById(am, AudioManager.GET_DEVICES_OUTPUTS, outputDeviceId);
-                if (dev != null) p.setPreferredDevice(dev);
+        if (outputDeviceId != null) this.lastOutputDeviceId = outputDeviceId;
+        final boolean[] answered = { false };
+        Thread starter = new Thread(() -> {
+            try {
+                File f;
+                if (url.startsWith("file://")) f = new File(url.substring(7));
+                else if (url.startsWith("/")) f = new File(url);
+                else {
+                    f = cachedFileFor(ctx, url);
+                    if (!f.exists() || f.length() <= 44) download(url, f);
+                }
+                if (!f.exists() || f.length() <= 44) throw new IOException("bed file missing/empty: " + f);
+                srcFile = f;
+
+                WavInfo wi = parseWav(f);
+                sampleRate = wi.sampleRate;
+                channels = wi.channels;
+                seekFrames = Math.max(0L, (long) fromMs * (long) wi.sampleRate / 1000L);
+
+                int chConfig = (channels == 2) ? AudioFormat.CHANNEL_OUT_STEREO : AudioFormat.CHANNEL_OUT_MONO;
+                int minBuf = AudioTrack.getMinBufferSize(sampleRate, chConfig, AudioFormat.ENCODING_PCM_16BIT);
+                if (minBuf <= 0) throw new IOException("AudioTrack.getMinBufferSize failed for " + sampleRate + " Hz");
+                int bufBytes = Math.max(minBuf * 2, sampleRate * channels * 2 / 4); // ~250 ms
+
+                AudioTrack t = new AudioTrack.Builder()
+                        .setAudioAttributes(new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                .build())
+                        .setAudioFormat(new AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(chConfig)
+                                .build())
+                        .setBufferSizeInBytes(bufBytes)
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .build();
+                if (t.getState() != AudioTrack.STATE_INITIALIZED) {
+                    try { t.release(); } catch (Exception ignored) {}
+                    throw new IOException("AudioTrack did not initialise");
+                }
+                if (outputDeviceId != null && am != null && Build.VERSION.SDK_INT >= 23) {
+                    AudioDeviceInfo dev = AudioDeviceCatalog.findById(am, AudioManager.GET_DEVICES_OUTPUTS, outputDeviceId);
+                    if (dev != null) t.setPreferredDevice(dev);
+                }
+
+                track = t;
+                playing = true;
+                t.play();
+                if (!answered[0]) { answered[0] = true; cb.onReady(true, null); }
+
+                feedLoop(t, wi);
+            } catch (Exception e) {
+                lastError = String.valueOf(e.getMessage());
+                playing = false;
+                if (!answered[0]) { answered[0] = true; cb.onReady(false, lastError); }
             }
-            p.setOnErrorListener((m, what, extra) -> {
-                lastError = "err " + what + "/" + extra;
-                if (!prepared) { cb.onReady(false, "MediaPlayer error " + what + "/" + extra); return true; }
-                // mid-playback error - try to recover so the beat keeps going
-                try { m.reset(); m.setDataSource(url); m.setLooping(loopWanted); m.prepare(); m.start(); }
-                catch (Exception e) { lastError = "recover failed: " + e.getMessage(); }
-                return true;
-            });
-            // setLooping should handle it, but on some devices / WAVs it silently
-            // stops at EOF - manual restart is the backstop (with looping on,
-            // onCompletion normally never fires, so this is harmless when it works)
-            p.setOnCompletionListener(m -> {
-                completions++;
-                lastError = "completion #" + completions;
-                if (loopWanted) {
-                    try { m.seekTo(0); m.start(); } catch (Exception e) { lastError = "loop restart failed: " + e.getMessage(); }
+        }, "bs-beat-monitor");
+        this.feeder = starter;
+        starter.start();
+    }
+
+    private void feedLoop(AudioTrack t, WavInfo wi) {
+        RandomAccessFile raf = null;
+        try {
+            raf = new RandomAccessFile(srcFile, "r");
+            final long dataStart = wi.dataOffset;
+            final long dataEnd = wi.dataOffset + wi.dataLen;
+            long startByte = dataStart + seekFrames * (long) wi.channels * 2L;
+            if (startByte > dataEnd) startByte = dataEnd;
+            // keep the seek on a frame boundary
+            startByte -= (startByte - dataStart) % ((long) wi.channels * 2L);
+            raf.seek(startByte);
+
+            byte[] buf = new byte[16384];
+            while (playing && !stopRequested) {
+                long remaining = dataEnd - raf.getFilePointer();
+                if (remaining <= 0) {
+                    completions++;
+                    if (loopWanted) { raf.seek(dataStart); continue; }
+                    break;
                 }
-            });
-            p.setOnPreparedListener(m -> {
-                prepared = true;
-                try {
-                    if (seekTo > 0) m.seekTo(seekTo);
-                    m.start();
-                    cb.onReady(true, null);
-                } catch (Exception e) {
-                    cb.onReady(false, String.valueOf(e.getMessage()));
+                int want = (int) Math.min((long) buf.length, remaining);
+                int n = raf.read(buf, 0, want);
+                if (n <= 0) break;
+                int off = 0;
+                while (off < n && playing && !stopRequested) {
+                    int w = t.write(buf, off, n - off);   // blocks in MODE_STREAM -> paces to real playback
+                    if (w < 0) { lastError = "AudioTrack.write " + w; playing = false; return; }
+                    off += w;
                 }
-            });
-            p.prepareAsync();
+            }
+            if (!stopRequested) {
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}   // let the tail drain
+            }
         } catch (Exception e) {
-            cb.onReady(false, String.valueOf(e.getMessage()));
+            // includes IllegalStateException if the track is released under a
+            // blocked write() during stop() - benign, we're tearing down anyway
+            if (!stopRequested) lastError = "feed: " + e.getMessage();
+        } finally {
+            if (raf != null) try { raf.close(); } catch (IOException ignored) {}
+            playing = false;
         }
     }
 
+    private long headFrames() {
+        AudioTrack t = track;
+        if (t == null) return 0;
+        try { return t.getPlaybackHeadPosition() & 0xffffffffL; }
+        catch (Exception e) { return 0; }
+    }
+
     int positionMs() {
-        try { return (mp != null && prepared) ? mp.getCurrentPosition() : -1; }
-        catch (Exception e) { return -1; }
+        if (track == null || !playing) return -1;
+        long songFrames = seekFrames + headFrames();
+        return (int) (songFrames * 1000L / Math.max(1, sampleRate));
+    }
+
+    /**
+     * {songFrameNow, nanoTime, sampleRate} - the song frame at the speaker right
+     * now and the CLOCK_MONOTONIC instant it holds for. Uses getTimestamp when
+     * it can (accounts for output latency), else head position + now.
+     */
+    long[] snapshot() {
+        AudioTrack t = track;
+        if (t == null || !playing) return null;
+        try {
+            AudioTimestamp ts = new AudioTimestamp();
+            if (Build.VERSION.SDK_INT >= 23 && t.getTimestamp(ts) && ts.framePosition >= 0) {
+                return new long[]{ seekFrames + ts.framePosition, ts.nanoTime, sampleRate };
+            }
+        } catch (Exception ignored) {}
+        return new long[]{ seekFrames + headFrames(), System.nanoTime(), sampleRate };
     }
 
     void seek(int ms) {
-        try { if (mp != null && prepared) mp.seekTo(Math.max(0, ms)); } catch (Exception e) {}
+        File f = srcFile;
+        if (f == null) return;
+        boolean loop = loopWanted;
+        String path = f.getAbsolutePath();
+        Integer outId = lastOutputDeviceId;
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        stop();
+        start(path, ms, loop, outId, am, (ok, err) -> {});
     }
 
     String setOutput(Integer outputDeviceId, AudioManager am) {
         try {
-            if (mp == null) return "no player";
-            if (Build.VERSION.SDK_INT < 28) return "output routing needs Android 9+";
-            if (outputDeviceId == null) { mp.setPreferredDevice(null); return "cleared -> default"; }
+            AudioTrack t = track;
+            if (t == null) return "no player";
+            if (Build.VERSION.SDK_INT < 23) return "output routing needs Android 6+";
+            if (outputDeviceId == null) { t.setPreferredDevice(null); return "cleared -> default"; }
             AudioDeviceInfo dev = AudioDeviceCatalog.findById(am, AudioManager.GET_DEVICES_OUTPUTS, outputDeviceId);
             if (dev == null) return "device #" + outputDeviceId + " not connected";
-            boolean ok = mp.setPreferredDevice(dev);
+            boolean ok = t.setPreferredDevice(dev);
             return AudioDeviceCatalog.labelFor(dev) + (ok ? "" : " (setPreferredDevice returned false)");
         } catch (Exception e) {
             return "error: " + e.getMessage();
@@ -124,17 +232,86 @@ final class BeatMonitor {
     }
 
     void stop() {
-        MediaPlayer p = mp;
-        mp = null;
-        prepared = false;
-        if (p != null) {
-            try { p.stop(); } catch (Exception e) {}
-            try { p.release(); } catch (Exception e) {}
+        stopRequested = true;
+        playing = false;
+        Thread fe = feeder; feeder = null;
+        AudioTrack t = track; track = null;
+        if (t != null) {
+            try { t.pause(); } catch (Exception ignored) {}
+            try { t.flush(); } catch (Exception ignored) {}
+            try { t.stop(); } catch (Exception ignored) {}
+            try { t.release(); } catch (Exception ignored) {}
+        }
+        if (fe != null && fe != Thread.currentThread()) {
+            try { fe.join(700); } catch (InterruptedException ignored) {}
         }
     }
 
-    // ---- local beat cache (so MediaPlayer plays from disk, not a network stream:
-    //      streaming a fresh URL adds ~1s+ of prepare latency to record-arm) ----
+    // ---- WAV header parsing (16-bit PCM, mono/stereo, any rate) ----
+
+    private static final class WavInfo {
+        int sampleRate;
+        int channels;
+        long dataOffset;
+        long dataLen;
+    }
+
+    private static WavInfo parseWav(File f) throws IOException {
+        try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
+            byte[] head = new byte[12];
+            raf.readFully(head);
+            if (head[0] != 'R' || head[1] != 'I' || head[2] != 'F' || head[3] != 'F'
+                    || head[8] != 'W' || head[9] != 'A' || head[10] != 'V' || head[11] != 'E') {
+                throw new IOException("not a RIFF/WAVE file");
+            }
+            WavInfo wi = new WavInfo();
+            long len = raf.length();
+            while (raf.getFilePointer() + 8 <= len) {
+                byte[] id = new byte[4];
+                raf.readFully(id);
+                long size = readLE32(raf);
+                long bodyStart = raf.getFilePointer();
+                long next = bodyStart + size + (size & 1L);
+                String cid = new String(id, "US-ASCII");
+                if ("fmt ".equals(cid)) {
+                    int audioFmt = readLE16(raf);
+                    wi.channels = readLE16(raf);
+                    wi.sampleRate = (int) readLE32(raf);
+                    readLE32(raf);  // byte rate
+                    readLE16(raf);  // block align
+                    int bits = readLE16(raf);
+                    if (bits != 16) throw new IOException("expected 16-bit PCM, got " + bits + "-bit");
+                    if (audioFmt != 1 && audioFmt != 0xFFFE) throw new IOException("non-PCM WAV (fmt " + audioFmt + ")");
+                } else if ("data".equals(cid)) {
+                    wi.dataOffset = bodyStart;
+                    wi.dataLen = Math.min(size, len - bodyStart);
+                    if (wi.sampleRate > 0) break;   // have fmt already; done
+                }
+                if (next <= raf.getFilePointer()) break;
+                raf.seek(next);
+            }
+            if (wi.sampleRate <= 0 || wi.channels <= 0 || wi.dataLen <= 0) {
+                throw new IOException("WAV missing fmt/data chunk");
+            }
+            if (wi.channels > 2) throw new IOException("unsupported channel count " + wi.channels);
+            return wi;
+        }
+    }
+
+    private static long readLE32(RandomAccessFile raf) throws IOException {
+        int b0 = raf.read(), b1 = raf.read(), b2 = raf.read(), b3 = raf.read();
+        if ((b0 | b1 | b2 | b3) < 0) throw new IOException("EOF in header");
+        return (b0 & 0xffL) | ((b1 & 0xffL) << 8) | ((b2 & 0xffL) << 16) | ((b3 & 0xffL) << 24);
+    }
+
+    private static int readLE16(RandomAccessFile raf) throws IOException {
+        int b0 = raf.read(), b1 = raf.read();
+        if ((b0 | b1) < 0) throw new IOException("EOF in header");
+        return (b0 & 0xff) | ((b1 & 0xff) << 8);
+    }
+
+    // ---- local cache + download (a local file means no MediaPlayer-style
+    //      buffering; the WebView-rendered monitor mix is already local) ----
 
     static File cachedFileFor(Context ctx, String url) {
         String ext = ".wav";

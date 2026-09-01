@@ -40,6 +40,7 @@ final class PcmWavRecorder {
         int sampleRate;
         int channels;
         long firstFrameLatencyMs;
+        long firstFrameNanos;      // absolute System.nanoTime() of the first captured sample
         boolean truncated;
         String source;
         String device;
@@ -192,6 +193,7 @@ final class PcmWavRecorder {
         out.truncated = truncated;
         out.durationMs = dataBytes * 1000L / (long) (sampleRate * channels * 2);
         out.firstFrameLatencyMs = firstFrameNanos > 0 ? (firstFrameNanos - startNanos) / 1_000_000L : 0;
+        out.firstFrameNanos = firstFrameNanos;
 
         // Hand the finished WAV file to the caller; it is served over a loopback
         // socket and deleted afterwards. No base64 (a full-song take is tens of MB

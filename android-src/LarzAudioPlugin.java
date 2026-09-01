@@ -48,6 +48,7 @@ public class LarzAudioPlugin extends Plugin {
     private BeatMonitor beatMonitor;
     private LocalFileServer takeServer;
     private long captureStartedAt;
+    private long[] captureBeatSnap;   // {songFrame, nanoTime, sampleRate} of the monitor bed at capture start
     private java.io.RandomAccessFile monitorMixRaf;   // chunked upload of the WebView-rendered monitor mix
 
     private void step(String stepName, JSObject data) {
@@ -146,6 +147,10 @@ public class LarzAudioPlugin extends Plugin {
 
             recorder.start(inputDeviceId);
             captureStartedAt = System.currentTimeMillis();
+            // Snapshot the beat monitor's sample-accurate position now, so
+            // stopCapture can place the take at the exact song time that was
+            // sounding when the mic's first sample landed (drift-free anchor).
+            captureBeatSnap = (beatMonitor != null && beatMonitor.isPlaying()) ? beatMonitor.snapshot() : null;
 
             JSObject ret = new JSObject();
             ret.put("started", true);
@@ -184,6 +189,25 @@ public class LarzAudioPlugin extends Plugin {
             ret.put("source", r.source);
             ret.put("device", r.device);
             ret.put("wallClockMs", System.currentTimeMillis() - captureStartedAt);
+
+            // Drift-free take placement: the beat monitor is an AudioTrack whose
+            // frame counter runs at exactly the DAC rate, so we can extrapolate
+            // its snapshot (taken at capture start) forward to the mic's first
+            // sample and hand JS the exact song second the take begins at.
+            long[] snap = captureBeatSnap;
+            captureBeatSnap = null;
+            if (snap != null && snap.length == 3 && snap[2] > 0 && r.firstFrameNanos > 0) {
+                double sr = (double) snap[2];
+                double frameAtMic = snap[0] + (r.firstFrameNanos - snap[1]) * sr / 1_000_000_000.0;
+                double songSec = frameAtMic / sr;
+                if (songSec >= 0 && songSec < 36000) {
+                    ret.put("beatSongMsAtFirstFrame", songSec * 1000.0);
+                }
+                JSObject sd = new JSObject();
+                sd.put("snapFrame", snap[0]); sd.put("snapNano", snap[1]); sd.put("sr", snap[2]);
+                sd.put("firstFrameNanos", r.firstFrameNanos); sd.put("songSec", songSec);
+                step("stopCapture:beatAnchor", sd);
+            }
 
             long bytes = 0;
             String url = "";
