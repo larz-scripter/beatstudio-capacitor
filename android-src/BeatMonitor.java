@@ -269,9 +269,8 @@ final class BeatMonitor {
             while (raf.getFilePointer() + 8 <= len) {
                 byte[] id = new byte[4];
                 raf.readFully(id);
-                long size = readLE32(raf);
-                long bodyStart = raf.getFilePointer();
-                long next = bodyStart + size + (size & 1L);
+                long size = readLE32(raf);                 // already unsigned (readLE32 masks)
+                long bodyStart = raf.getFilePointer();     // = chunk header + 8
                 String cid = new String(id, "US-ASCII");
                 if ("fmt ".equals(cid)) {
                     int audioFmt = readLE16(raf);
@@ -284,11 +283,14 @@ final class BeatMonitor {
                     if (audioFmt != 1 && audioFmt != 0xFFFE) throw new IOException("non-PCM WAV (fmt " + audioFmt + ")");
                 } else if ("data".equals(cid)) {
                     wi.dataOffset = bodyStart;
-                    wi.dataLen = Math.min(size, len - bodyStart);
-                    if (wi.sampleRate > 0) break;   // have fmt already; done
+                    long avail = len - bodyStart;
+                    // some writers leave a stale/zero data size in a streamed header
+                    wi.dataLen = (size > 0 && size <= avail) ? size : avail;
                 }
-                if (next <= raf.getFilePointer()) break;
-                raf.seek(next);
+                if (wi.sampleRate > 0 && wi.dataLen > 0) break;   // have both - stop
+                long next = bodyStart + size + (size & 1L);       // pad to even
+                if (next <= bodyStart || next > len) break;       // malformed size
+                raf.seek(next);                                   // jump to the next chunk
             }
             if (wi.sampleRate <= 0 || wi.channels <= 0 || wi.dataLen <= 0) {
                 throw new IOException("WAV missing fmt/data chunk");
