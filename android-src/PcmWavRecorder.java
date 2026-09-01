@@ -149,7 +149,15 @@ final class PcmWavRecorder {
             writeWavHeader(raf, 0);
             raf.seek(44);
 
-            byte[] buf = new byte[Math.min(Math.max(bufBytes, 4096), 32768)];
+            // read() BLOCKS until the requested size is captured, so a big
+            // read makes firstFrameNanos land a whole buffer late (a 32 KB /
+            // ~341 ms read was throwing take placement ~340 ms off-beat).
+            // Small reads + back-dating by the returned span pin the first
+            // captured sample precisely.
+            final int frameBytes = channels * 2;
+            int chunk = (sampleRate / 50) * frameBytes;                 // ~20 ms
+            chunk = Math.max(frameBytes * 64, Math.min(chunk, 8192));
+            byte[] buf = new byte[chunk];
             long capBytes = (long) MAX_SECONDS * sampleRate * channels * 2L;
             boolean first = true;
 
@@ -160,7 +168,10 @@ final class PcmWavRecorder {
                             || n == AudioRecord.ERROR_DEAD_OBJECT) break;
                     continue;
                 }
-                if (first) { firstFrameNanos = System.nanoTime(); first = false; }
+                if (first) {
+                    firstFrameNanos = estimateFirstFrameNanos(n);
+                    first = false;
+                }
                 raf.write(buf, 0, n);
                 dataBytes += n;
                 emitLevel(buf, n);
@@ -218,6 +229,28 @@ final class PcmWavRecorder {
     }
 
     // ---- helpers ----
+
+    /**
+     * Absolute {@link System#nanoTime} of the first captured PCM sample.
+     * Prefers {@link AudioRecord#getTimestamp} (a hardware-clocked frame
+     * position, API 24+); falls back to back-dating the first read() by the
+     * span of bytes it returned - either way the anchor no longer lands a
+     * whole read-buffer late.
+     */
+    private long estimateFirstFrameNanos(int firstBytes) {
+        long now = System.nanoTime();
+        try {
+            android.media.AudioTimestamp ts = new android.media.AudioTimestamp();
+            if (record != null
+                    && record.getTimestamp(ts, android.media.AudioTimestamp.TIMEBASE_MONOTONIC)
+                       == AudioRecord.SUCCESS
+                    && ts.framePosition > 0) {
+                return ts.nanoTime - ts.framePosition * 1_000_000_000L / (long) sampleRate;
+            }
+        } catch (Throwable ignored) {}
+        long spanNanos = (long) firstBytes * 1_000_000_000L / (long) (sampleRate * channels * 2);
+        return now - spanNanos;
+    }
 
     private void deleteTemp() {
         if (wav != null && wav.exists()) {
