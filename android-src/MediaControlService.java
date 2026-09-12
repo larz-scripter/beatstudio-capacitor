@@ -14,6 +14,7 @@ import android.os.PowerManager;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
+import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 import androidx.media.app.NotificationCompat.MediaStyle;
@@ -28,6 +29,7 @@ import androidx.media.app.NotificationCompat.MediaStyle;
  */
 public class MediaControlService extends Service {
 
+    private static final String TAG = "BeatStudioMedia";
     private static final String CHANNEL_ID = "beatstudio_playback";
     private static final int NOTIF_ID = 4271;
 
@@ -45,44 +47,64 @@ public class MediaControlService extends Service {
     private MediaSessionCompat mediaSession;
     private PowerManager.WakeLock wakeLock;
 
+    // Every entry point below is wrapped defensively: this service exists to
+    // ADD background playback, and must never be the reason the whole app
+    // (WebView included) gets taken down by an uncaught exception here - an
+    // unhandled crash in a Service kills the entire host process. Any
+    // failure just means background playback stays unavailable for this
+    // session (same as before this feature existed), logged via Log.e so a
+    // logcat pull explains why.
+
     @Override
     public void onCreate() {
         super.onCreate();
-        mediaSession = new MediaSessionCompat(this, "BeatStudioMedia");
-        mediaSession.setCallback(new MediaSessionCompat.Callback() {
-            @Override public void onPlay() { fire(ACTION_PLAY); }
-            @Override public void onPause() { fire(ACTION_PAUSE); }
-            @Override public void onSkipToNext() { fire(ACTION_NEXT); }
-            @Override public void onSkipToPrevious() { fire(ACTION_PREV); }
-            @Override public void onStop() { fire(ACTION_STOP); }
-        });
-        mediaSession.setActive(true);
+        try {
+            mediaSession = new MediaSessionCompat(this, "BeatStudioMedia");
+            mediaSession.setCallback(new MediaSessionCompat.Callback() {
+                @Override public void onPlay() { fire(ACTION_PLAY); }
+                @Override public void onPause() { fire(ACTION_PAUSE); }
+                @Override public void onSkipToNext() { fire(ACTION_NEXT); }
+                @Override public void onSkipToPrevious() { fire(ACTION_PREV); }
+                @Override public void onStop() { fire(ACTION_STOP); }
+            });
+            mediaSession.setActive(true);
+        } catch (Throwable t) {
+            Log.e(TAG, "MediaSession init failed", t);
+            mediaSession = null;
+        }
 
-        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BeatStudio:playback");
-        wakeLock.setReferenceCounted(false);
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BeatStudio:playback");
+            wakeLock.setReferenceCounted(false);
+        } catch (Throwable t) {
+            Log.e(TAG, "WakeLock init failed", t);
+            wakeLock = null;
+        }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        String action = (intent != null && intent.getAction() != null) ? intent.getAction() : ACTION_UPDATE;
+        try {
+            String action = (intent != null && intent.getAction() != null) ? intent.getAction() : ACTION_UPDATE;
 
-        if (ACTION_STOP.equals(action)) {
-            fire(ACTION_STOP);
-            stopSelfSafely();
+            if (ACTION_STOP.equals(action)) {
+                fire(ACTION_STOP);
+                stopSelfSafely();
+                return START_NOT_STICKY;
+            }
+            if (ACTION_PLAY.equals(action) || ACTION_PAUSE.equals(action)
+                    || ACTION_NEXT.equals(action) || ACTION_PREV.equals(action)) {
+                fire(action);
+            }
+
+            if (intent != null && intent.hasExtra("title")) {
+                applyState(intent);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "onStartCommand failed - stopping self, background playback unavailable this session", t);
+            try { stopSelf(); } catch (Throwable ignored) {}
             return START_NOT_STICKY;
-        }
-        if (ACTION_PLAY.equals(action) || ACTION_PAUSE.equals(action)
-                || ACTION_NEXT.equals(action) || ACTION_PREV.equals(action)) {
-            fire(action);
-        }
-
-        if (intent != null && intent.hasExtra("title")) {
-            applyState(intent);
-        } else if (!ACTION_UPDATE.equals(action)) {
-            // A bare transport-button tap with no state payload - just keep
-            // the existing notification alive, JS will push a fresh
-            // nowPlaying() once it reacts to the 'control' event.
         }
         return START_STICKY;
     }
@@ -94,31 +116,46 @@ public class MediaControlService extends Service {
         long position = intent.getLongExtra("position", 0);
         long duration = intent.getLongExtra("duration", 0);
 
-        MediaMetadataCompat.Builder meta = new MediaMetadataCompat.Builder()
-                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title != null && !title.isEmpty() ? title : "BeatStudio")
-                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist != null ? artist : "")
-                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration);
-        mediaSession.setMetadata(meta.build());
+        if (mediaSession != null) {
+            try {
+                MediaMetadataCompat.Builder meta = new MediaMetadataCompat.Builder()
+                        .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title != null && !title.isEmpty() ? title : "BeatStudio")
+                        .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist != null ? artist : "")
+                        .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration);
+                mediaSession.setMetadata(meta.build());
 
-        int state = isPlaying ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
-        PlaybackStateCompat.Builder pb = new PlaybackStateCompat.Builder()
-                .setActions(PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE
-                        | PlaybackStateCompat.ACTION_PLAY_PAUSE | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
-                        | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_STOP)
-                .setState(state, position, isPlaying ? 1f : 0f);
-        mediaSession.setPlaybackState(pb.build());
+                int state = isPlaying ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
+                PlaybackStateCompat.Builder pb = new PlaybackStateCompat.Builder()
+                        .setActions(PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE
+                                | PlaybackStateCompat.ACTION_PLAY_PAUSE | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+                                | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_STOP)
+                        .setState(state, position, isPlaying ? 1f : 0f);
+                mediaSession.setPlaybackState(pb.build());
+            } catch (Throwable t) {
+                Log.e(TAG, "session metadata/state update failed", t);
+            }
+        }
 
-        Notification n = buildNotification(title, artist, isPlaying);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-        } else {
-            startForeground(NOTIF_ID, n);
+        try {
+            Notification n = buildNotification(title, artist, isPlaying);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+            } else {
+                startForeground(NOTIF_ID, n);
+            }
+        } catch (Throwable t) {
+            // Most likely failure point: ForegroundServiceStartNotAllowedException
+            // (Android 12+ background-start restrictions) or a missing/invalid
+            // notification channel/icon. Never let this take the app down.
+            Log.e(TAG, "startForeground failed - stopping self, background playback unavailable this session", t);
+            try { stopSelf(); } catch (Throwable ignored) {}
+            return;
         }
 
         try {
             if (isPlaying) {
-                if (!wakeLock.isHeld()) wakeLock.acquire(6 * 60 * 60 * 1000L);
-            } else if (wakeLock.isHeld()) {
+                if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(6 * 60 * 60 * 1000L);
+            } else if (wakeLock != null && wakeLock.isHeld()) {
                 wakeLock.release();
             }
         } catch (Throwable ignored) {}
@@ -153,10 +190,14 @@ public class MediaControlService extends Service {
                 .addAction(android.R.drawable.ic_media_previous, "Previous", prev)
                 .addAction(isPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
                         isPlaying ? "Pause" : "Play", playPause)
-                .addAction(android.R.drawable.ic_media_next, "Next", next)
-                .setStyle(new MediaStyle()
-                        .setMediaSession(mediaSession.getSessionToken())
-                        .setShowActionsInCompactView(0, 1, 2));
+                .addAction(android.R.drawable.ic_media_next, "Next", next);
+        if (mediaSession != null) {
+            // Falls back to a plain notification (still keeps the process
+            // alive + still has working buttons) if the session failed to init.
+            b.setStyle(new MediaStyle()
+                    .setMediaSession(mediaSession.getSessionToken())
+                    .setShowActionsInCompactView(0, 1, 2));
+        }
         if (contentIntent != null) b.setContentIntent(contentIntent);
         return b.build();
     }
