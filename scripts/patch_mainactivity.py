@@ -3,12 +3,17 @@
 
 MainActivity.java:
   - register the LarzAudio native plugin (device enumeration + AudioRecord capture)
+  - register the LarzMedia native plugin (background-playback foreground
+    service + MediaSession notification)
   - grant the WebView's own getUserMedia mic request (fallback path) without a
     second prompt once RECORD_AUDIO is held
 
 AndroidManifest.xml:
   - RECORD_AUDIO + MODIFY_AUDIO_SETTINGS (a Capacitor app still needs these
     declared for the runtime dialog to appear)
+  - FOREGROUND_SERVICE + FOREGROUND_SERVICE_MEDIA_PLAYBACK + WAKE_LOCK +
+    POST_NOTIFICATIONS, and the <service> entry for MediaControlService
+    (background audio playback)
 
 Run after `npx cap add android` and after the plugin .java files are copied in.
 """
@@ -47,6 +52,9 @@ public class MainActivity extends BridgeActivity {
         // Native audio connector — enumerates every input/output device and
         // captures the chosen one via AudioRecord, independent of the WebView.
         registerPlugin(LarzAudioPlugin.class);
+        // Background playback bridge — foreground service + MediaSession so
+        // the WebView's <audio> element survives being backgrounded/screen-off.
+        registerPlugin(LarzMediaPlugin.class);
         super.onCreate(savedInstanceState);
 
         try {
@@ -95,7 +103,7 @@ public class MainActivity extends BridgeActivity {
 }
 """.replace("__PKG__", pkg)
 open(path, "w").write(new)
-print("patched MainActivity (package " + pkg + ", registered LarzAudioPlugin)")
+print("patched MainActivity (package " + pkg + ", registered LarzAudioPlugin + LarzMediaPlugin)")
 
 # ------------------------------------------------- network security config
 # capacitor.config sets cleartext:false, which blocks ALL http:// including
@@ -138,6 +146,14 @@ if "android.permission.RECORD_AUDIO" not in mtxt:
     perms += '    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n'
 if "android.permission.MODIFY_AUDIO_SETTINGS" not in mtxt:
     perms += '    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n'
+if "android.permission.FOREGROUND_SERVICE\"" not in mtxt:
+    perms += '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n'
+if "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" not in mtxt:
+    perms += '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>\n'
+if "android.permission.WAKE_LOCK" not in mtxt:
+    perms += '    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n'
+if "android.permission.POST_NOTIFICATIONS" not in mtxt:
+    perms += '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n'
 if perms:
     m2 = re.search(r"<manifest\b[^>]*>", mtxt)
     if not m2:
@@ -152,5 +168,13 @@ if "networkSecurityConfig" not in mtxt:
                   r'\1 android:networkSecurityConfig="@xml/' + nsc_name + '"',
                   mtxt, count=1)
     print("patched AndroidManifest (networkSecurityConfig -> @xml/" + nsc_name + ")")
+
+# background-playback foreground service
+if "MediaControlService" not in mtxt:
+    svc = ('        <service android:name=".MediaControlService"\n'
+           '            android:foregroundServiceType="mediaPlayback"\n'
+           '            android:exported="false"/>\n')
+    mtxt = mtxt.replace("</application>", svc + "    </application>", 1)
+    print("patched AndroidManifest (added MediaControlService)")
 
 open(mf, "w").write(mtxt)

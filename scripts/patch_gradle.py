@@ -21,10 +21,18 @@ if os.path.isfile(V):
 P = "android/app/build.gradle"
 s = open(P).read()
 
-s = re.sub(r"versionCode\s+\d+", "versionCode 10", s, count=1)
-s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.10"', s, count=1)
+s = re.sub(r"versionCode\s+\d+", "versionCode 11", s, count=1)
+s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.11"', s, count=1)
 s = re.sub(r"minSdkVersion\s+rootProject\.ext\.minSdkVersion", "minSdkVersion 28", s, count=1)
 s = re.sub(r"minSdk\s+\d+", "minSdk 28", s, count=1)
+
+# androidx.media gives MediaSessionCompat / NotificationCompat.MediaStyle for
+# the background-playback notification (MediaControlService.java).
+if "androidx.media:media" not in s:
+    s = re.sub(r"dependencies\s*\{",
+               'dependencies {\n    implementation "androidx.media:media:1.7.0"',
+               s, count=1)
+    print("patched android/app/build.gradle (androidx.media dependency)")
 
 SIGN = """
     signingConfigs {
@@ -44,4 +52,4 @@ s = re.sub(r"(buildTypes\s*\{\s*release\s*\{)",
            s, count=1)
 
 open(P, "w").write(s)
-print("patched android/app/build.gradle (version + signing + minSdk 28)")
+print("patched android/app/build.gradle (version 11/1.11 + signing + minSdk 28)")
