@@ -167,7 +167,15 @@ public class MediaControlService extends Service {
         try {
             String action = (intent != null && intent.getAction() != null) ? intent.getAction() : ACTION_UPDATE;
 
-            if (ACTION_STOP.equals(action)) { fire(ACTION_STOP); handleStop(); return START_NOT_STICKY; }
+            // Unlike play/pause/next/prev, this used to fire ACTION_STOP
+            // back to JS unconditionally on every stop - not just when
+            // nothing was loaded - which is a redundant round trip for
+            // the same reason the other actions' unconditional fallback
+            // turned into a ping-pong loop (confirmed on-device for play/
+            // next/prev/pause this session). handleStop() already does
+            // its job regardless of what was loaded, so there's nothing
+            // for a live page to additionally handle here.
+            if (ACTION_STOP.equals(action)) { handleStop(); return START_NOT_STICKY; }
             else if (ACTION_PLAY.equals(action)) handlePlay();
             else if (ACTION_PAUSE.equals(action)) handlePause();
             else if (ACTION_NEXT.equals(action)) handleNext();
