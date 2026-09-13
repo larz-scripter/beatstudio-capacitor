@@ -8,24 +8,48 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.media.AudioAttributes;
+import android.media.MediaPlayer;
+import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
 import android.util.Log;
+import android.webkit.CookieManager;
 
 import androidx.core.app.NotificationCompat;
 import androidx.media.app.NotificationCompat.MediaStyle;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 /**
- * Foreground service that keeps BeatStudio's WebView audio alive in the
- * background: a media-style notification + MediaSession stop Doze/App
- * Standby from freezing the process, and add play/pause/next/prev on the
- * lock screen. Playback itself never moves here - it stays in the WebView's
- * <audio> element. This service only mirrors state LarzMediaPlugin reports
- * from JS, and forwards button taps back to it.
+ * Foreground service that OWNS real playback via a native MediaPlayer once a
+ * queue has been loaded (see LarzMediaPlugin.loadQueue), instead of just
+ * mirroring a notification for whatever the page's own &lt;audio&gt; element
+ * happens to be doing. That distinction is the whole point: BeatStudio's
+ * pages are plain server-rendered pages, not an SPA, so navigating to any
+ * other page in the app destroys the previous page's JS and its &lt;audio&gt;
+ * element entirely - there is nothing left alive to react to a notification
+ * button press. A Service has no such lifecycle tie, so play/pause/next/
+ * prev from the notification or lock screen keep working regardless of what
+ * page (if any) is currently shown, and playback itself keeps going when
+ * you navigate away instead of stopping.
+ *
+ * Falls back to the older passive "mirror whatever nowPlaying() reports"
+ * behaviour (applyState/ACTION_UPDATE) when no queue has ever been loaded,
+ * so existing integrations that only call nowPlaying() still work.
  */
 public class MediaControlService extends Service {
 
@@ -39,13 +63,50 @@ public class MediaControlService extends Service {
     public static final String ACTION_PREV = "com.larzos.beatstudio.action.PREV";
     public static final String ACTION_STOP = "com.larzos.beatstudio.action.STOP";
     public static final String ACTION_UPDATE = "com.larzos.beatstudio.action.UPDATE";
+    public static final String ACTION_LOAD_QUEUE = "com.larzos.beatstudio.action.LOAD_QUEUE";
+    public static final String ACTION_PLAY_AT = "com.larzos.beatstudio.action.PLAY_AT";
+    public static final String ACTION_SEEK = "com.larzos.beatstudio.action.SEEK";
+    public static final String ACTION_SET_REPEAT = "com.larzos.beatstudio.action.SET_REPEAT";
 
+    /** Fired for a transport button tap that this service can't fully
+     *  handle itself (nothing loaded natively yet) - lets a page that
+     *  happens to be alive react the old way. */
     public interface ControlListener { void onControl(String action); }
     private static volatile ControlListener listener;
     public static void setControlListener(ControlListener l) { listener = l; }
 
+    /** Fired on every native playback state change, so a page that's alive
+     *  right now (e.g. you just navigated back to it) can sync its own UI -
+     *  seek bar, title, play/pause icon - to what's actually already
+     *  playing, instead of assuming nothing is. */
+    public interface StateListener { void onState(JSONObject state); }
+    private static volatile StateListener stateListener;
+    public static void setStateListener(StateListener l) { stateListener = l; }
+
+    /** Last broadcast snapshot, so LarzMediaPlugin.getState() can answer
+     *  synchronously (a freshly-loaded page's first render) without waiting
+     *  for the next tick. */
+    private static volatile JSONObject lastState = null;
+    public static JSONObject getLastState() { return lastState; }
+
     private MediaSessionCompat mediaSession;
     private PowerManager.WakeLock wakeLock;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    // ---- native playback / queue state ----
+    private MediaPlayer player;
+    private JSONArray queue;      // [{url,title,artist,durationSec}, ...] in original order
+    private int[] order;          // permutation of indices into `queue` - identity or shuffled
+    private int pos = -1;         // index into `order`; -1 = nothing loaded
+    private int repeatMode = 0;   // 0 off, 1 one, 2 all
+    private boolean preparing = false;
+
+    private final Runnable progressTick = new Runnable() {
+        @Override public void run() {
+            broadcastState();
+            if (isPlayingSafe()) mainHandler.postDelayed(this, 1000);
+        }
+    };
 
     // Every entry point below is wrapped defensively: this service exists to
     // ADD background playback, and must never be the reason the whole app
@@ -61,11 +122,12 @@ public class MediaControlService extends Service {
         try {
             mediaSession = new MediaSessionCompat(this, "BeatStudioMedia");
             mediaSession.setCallback(new MediaSessionCompat.Callback() {
-                @Override public void onPlay() { fire(ACTION_PLAY); }
-                @Override public void onPause() { fire(ACTION_PAUSE); }
-                @Override public void onSkipToNext() { fire(ACTION_NEXT); }
-                @Override public void onSkipToPrevious() { fire(ACTION_PREV); }
-                @Override public void onStop() { fire(ACTION_STOP); }
+                @Override public void onPlay() { handlePlay(); }
+                @Override public void onPause() { handlePause(); }
+                @Override public void onSkipToNext() { handleNext(); }
+                @Override public void onSkipToPrevious() { handlePrev(); }
+                @Override public void onStop() { handleStop(); }
+                @Override public void onSeekTo(long posMs) { handleSeek(posMs); }
             });
             mediaSession.setActive(true);
         } catch (Throwable t) {
@@ -88,19 +150,16 @@ public class MediaControlService extends Service {
         try {
             String action = (intent != null && intent.getAction() != null) ? intent.getAction() : ACTION_UPDATE;
 
-            if (ACTION_STOP.equals(action)) {
-                fire(ACTION_STOP);
-                stopSelfSafely();
-                return START_NOT_STICKY;
-            }
-            if (ACTION_PLAY.equals(action) || ACTION_PAUSE.equals(action)
-                    || ACTION_NEXT.equals(action) || ACTION_PREV.equals(action)) {
-                fire(action);
-            }
-
-            if (intent != null && intent.hasExtra("title")) {
-                applyState(intent);
-            }
+            if (ACTION_STOP.equals(action)) { fire(ACTION_STOP); handleStop(); return START_NOT_STICKY; }
+            else if (ACTION_PLAY.equals(action)) handlePlay();
+            else if (ACTION_PAUSE.equals(action)) handlePause();
+            else if (ACTION_NEXT.equals(action)) handleNext();
+            else if (ACTION_PREV.equals(action)) handlePrev();
+            else if (ACTION_LOAD_QUEUE.equals(action)) handleLoadQueue(intent);
+            else if (ACTION_PLAY_AT.equals(action)) handlePlayAt(indexOfTrack(intent.getIntExtra("index", 0)));
+            else if (ACTION_SEEK.equals(action)) handleSeek(intent.getLongExtra("positionMs", 0));
+            else if (ACTION_SET_REPEAT.equals(action)) repeatMode = intent.getIntExtra("repeat", repeatMode);
+            else if (intent != null && intent.hasExtra("title")) applyState(intent);
         } catch (Throwable t) {
             Log.e(TAG, "onStartCommand failed - stopping self, background playback unavailable this session", t);
             try { stopSelf(); } catch (Throwable ignored) {}
@@ -109,33 +168,253 @@ public class MediaControlService extends Service {
         return START_STICKY;
     }
 
+    // ---- queue-based playback (the real fix - survives page navigation) ----
+
+    private void handleLoadQueue(Intent intent) {
+        try {
+            // Captured from the OLD queue/order before we overwrite them -
+            // e.g. toggling shuffle mid-song sends a whole new queue+order
+            // but the currently-playing track is still the same one, and
+            // should keep playing uninterrupted rather than restart from 0.
+            String currentUrl = currentTrackUrl();
+
+            queue = new JSONArray(intent.getStringExtra("queue"));
+            int startTrackIndex = intent.getIntExtra("startIndex", 0);
+            repeatMode = intent.getIntExtra("repeat", 0);
+            boolean shuffle = intent.getBooleanExtra("shuffle", false);
+            buildOrder(shuffle, startTrackIndex);
+            int newPos = indexOfTrack(startTrackIndex);
+
+            String targetUrl = null;
+            try { targetUrl = queue.getJSONObject(order[newPos]).optString("url", null); } catch (Throwable ignored) {}
+
+            if (player != null && !preparing && targetUrl != null && targetUrl.equals(currentUrl)) {
+                pos = newPos;
+                pushNotificationForCurrentTrack(isPlayingSafe());
+            } else {
+                handlePlayAt(newPos);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "loadQueue failed", t);
+        }
+    }
+
+    private String currentTrackUrl() {
+        if (queue == null || order == null || pos < 0 || pos >= order.length) return null;
+        try { return queue.getJSONObject(order[pos]).optString("url", null); } catch (Throwable t) { return null; }
+    }
+
+    private void buildOrder(boolean shuffle, int startTrackIndex) {
+        int n = queue.length();
+        order = new int[n];
+        for (int i = 0; i < n; i++) order[i] = i;
+        if (shuffle && n > 0) {
+            List<Integer> rest = new ArrayList<>();
+            for (int i = 0; i < n; i++) if (i != startTrackIndex) rest.add(i);
+            Collections.shuffle(rest);
+            order[0] = startTrackIndex;
+            for (int i = 0; i < rest.size(); i++) order[i + 1] = rest.get(i);
+        }
+    }
+
+    /** order[]-position of a raw track index - used when JS asks to play a
+     *  specific track (e.g. tapped from a list) rather than next/prev. */
+    private int indexOfTrack(int trackIndex) {
+        if (order == null) return 0;
+        for (int i = 0; i < order.length; i++) if (order[i] == trackIndex) return i;
+        return 0;
+    }
+
+    private void handlePlayAt(int newPos) {
+        if (queue == null || order == null || order.length == 0) return;
+        if (newPos < 0 || newPos >= order.length) return;
+        pos = newPos;
+        try {
+            JSONObject track = queue.getJSONObject(order[pos]);
+            String url = track.optString("url", null);
+            if (url == null || url.isEmpty()) { Log.e(TAG, "track has no url at order[" + pos + "]"); return; }
+
+            releasePlayer();
+            preparing = true;
+            player = new MediaPlayer();
+            player.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build());
+            // BeatStudio's own recorded/mixed songs are served behind the
+            // user's logged-in session; MediaPlayer doesn't share the
+            // WebView's cookie jar automatically, so pass it explicitly or
+            // anything but the public beat catalog 401s/403s.
+            String cookie = null;
+            try { cookie = CookieManager.getInstance().getCookie(url); } catch (Throwable ignored) {}
+            if (cookie != null && !cookie.isEmpty()) {
+                Map<String, String> headers = new HashMap<>();
+                headers.put("Cookie", cookie);
+                player.setDataSource(getApplicationContext(), Uri.parse(url), headers);
+            } else {
+                player.setDataSource(url);
+            }
+            player.setOnPreparedListener(mp -> {
+                preparing = false;
+                try { mp.start(); } catch (Throwable ignored) {}
+                mainHandler.post(progressTick);
+                pushNotificationForCurrentTrack(true);
+            });
+            player.setOnCompletionListener(mp -> handleTrackCompleted());
+            player.setOnErrorListener((mp, what, extra) -> {
+                Log.e(TAG, "MediaPlayer error what=" + what + " extra=" + extra + " url=" + url);
+                preparing = false;
+                handleNext();
+                return true;
+            });
+            player.prepareAsync();
+            pushNotificationForCurrentTrack(false); // shows the title immediately while it loads
+        } catch (Throwable t) {
+            Log.e(TAG, "playAt failed", t);
+        }
+    }
+
+    private void handleTrackCompleted() {
+        if (repeatMode == 1) { handlePlayAt(pos); return; } // repeat-one: replay this slot
+        int next = pos + 1;
+        if (next >= order.length) {
+            if (repeatMode == 2) handlePlayAt(0); else handleStop();
+        } else {
+            handlePlayAt(next);
+        }
+    }
+
+    private void handlePlay() {
+        if (player != null && !preparing) {
+            try { player.start(); mainHandler.post(progressTick); pushNotificationForCurrentTrack(true); }
+            catch (Throwable ignored) {}
+        } else {
+            fire(ACTION_PLAY); // nothing loaded natively yet - a live page can still handle it
+        }
+    }
+
+    private void handlePause() {
+        if (player != null && !preparing) {
+            try { player.pause(); pushNotificationForCurrentTrack(false); } catch (Throwable ignored) {}
+        } else {
+            fire(ACTION_PAUSE);
+        }
+    }
+
+    private void handleNext() {
+        if (order != null && order.length > 0) {
+            int next = pos + 1;
+            if (next >= order.length) { if (repeatMode == 2) handlePlayAt(0); }
+            else handlePlayAt(next);
+        } else {
+            fire(ACTION_NEXT);
+        }
+    }
+
+    private void handlePrev() {
+        if (order != null && order.length > 0) {
+            try {
+                if (player != null && player.getCurrentPosition() > 3000) { player.seekTo(0); broadcastState(); return; }
+            } catch (Throwable ignored) {}
+            if (pos > 0) handlePlayAt(pos - 1);
+        } else {
+            fire(ACTION_PREV);
+        }
+    }
+
+    private void handleSeek(long ms) {
+        if (player != null) {
+            try { player.seekTo((int) ms); broadcastState(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private void handleStop() {
+        releasePlayer();
+        queue = null; order = null; pos = -1;
+        stopSelfSafely();
+    }
+
+    private boolean isPlayingSafe() {
+        try { return player != null && player.isPlaying(); } catch (Throwable t) { return false; }
+    }
+
+    private void releasePlayer() {
+        mainHandler.removeCallbacks(progressTick);
+        if (player != null) {
+            try { player.reset(); player.release(); } catch (Throwable ignored) {}
+            player = null;
+        }
+    }
+
+    // ---- notification / session for the current queue track ----
+
+    private void pushNotificationForCurrentTrack(boolean isPlaying) {
+        if (queue == null || order == null || pos < 0 || pos >= order.length) return;
+        try {
+            JSONObject track = queue.getJSONObject(order[pos]);
+            String title = track.optString("title", "BeatStudio");
+            String artist = track.optString("artist", "");
+            long duration = 0;
+            try { if (player != null) duration = player.getDuration(); } catch (Throwable ignored) {}
+            if (duration <= 0) duration = (long) (track.optDouble("durationSec", 0) * 1000);
+            long position = 0;
+            try { if (player != null) position = player.getCurrentPosition(); } catch (Throwable ignored) {}
+
+            applyMediaSession(title, artist, isPlaying, position, duration);
+
+            Notification n = buildNotification(title, artist, isPlaying);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+            } else {
+                startForeground(NOTIF_ID, n);
+            }
+            if (isPlaying) { if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(6 * 60 * 60 * 1000L); }
+            else if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+            broadcastState();
+        } catch (Throwable t) {
+            Log.e(TAG, "pushNotificationForCurrentTrack failed", t);
+        }
+    }
+
+    private void broadcastState() {
+        if (queue == null || order == null || pos < 0 || pos >= order.length) return;
+        try {
+            JSONObject track = queue.getJSONObject(order[pos]);
+            JSONObject state = new JSONObject();
+            state.put("trackIndex", order[pos]);
+            // The one field a page should actually key off of: JS always
+            // sends shuffle:false and pre-orders the queue itself, so
+            // trackIndex/queuePos are positions in whatever order THIS
+            // playback session was loaded with - meaningless to a page that
+            // just loaded fresh and built its own (possibly differently
+            // shuffled) order[]. Matching on the URL instead needs no
+            // shared position scheme at all.
+            state.put("url", track.optString("url", ""));
+            state.put("title", track.optString("title", ""));
+            state.put("artist", track.optString("artist", ""));
+            state.put("isPlaying", isPlayingSafe());
+            long positionMs = 0, durationMs = 0;
+            try { if (player != null) positionMs = player.getCurrentPosition(); } catch (Throwable ignored) {}
+            try { if (player != null) durationMs = player.getDuration(); } catch (Throwable ignored) {}
+            state.put("positionMs", positionMs);
+            state.put("durationMs", durationMs);
+            state.put("queuePos", pos);
+            state.put("queueLen", order.length);
+            lastState = state;
+            StateListener l = stateListener;
+            if (l != null) l.onState(state);
+        } catch (Throwable ignored) {}
+    }
+
+    // ---- legacy passive path (nowPlaying() only, no queue ever loaded) ----
+
     private void applyState(Intent intent) {
         String title = intent.getStringExtra("title");
         String artist = intent.getStringExtra("artist");
         boolean isPlaying = intent.getBooleanExtra("isPlaying", false);
         long position = intent.getLongExtra("position", 0);
         long duration = intent.getLongExtra("duration", 0);
-
-        if (mediaSession != null) {
-            try {
-                MediaMetadataCompat.Builder meta = new MediaMetadataCompat.Builder()
-                        .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title != null && !title.isEmpty() ? title : "BeatStudio")
-                        .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist != null ? artist : "")
-                        .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration);
-                mediaSession.setMetadata(meta.build());
-
-                int state = isPlaying ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
-                PlaybackStateCompat.Builder pb = new PlaybackStateCompat.Builder()
-                        .setActions(PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE
-                                | PlaybackStateCompat.ACTION_PLAY_PAUSE | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
-                                | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_STOP)
-                        .setState(state, position, isPlaying ? 1f : 0f);
-                mediaSession.setPlaybackState(pb.build());
-            } catch (Throwable t) {
-                Log.e(TAG, "session metadata/state update failed", t);
-            }
-        }
-
+        applyMediaSession(title, artist, isPlaying, position, duration);
         try {
             Notification n = buildNotification(title, artist, isPlaying);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -144,21 +423,36 @@ public class MediaControlService extends Service {
                 startForeground(NOTIF_ID, n);
             }
         } catch (Throwable t) {
-            // Most likely failure point: ForegroundServiceStartNotAllowedException
-            // (Android 12+ background-start restrictions) or a missing/invalid
-            // notification channel/icon. Never let this take the app down.
             Log.e(TAG, "startForeground failed - stopping self, background playback unavailable this session", t);
             try { stopSelf(); } catch (Throwable ignored) {}
             return;
         }
-
         try {
-            if (isPlaying) {
-                if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(6 * 60 * 60 * 1000L);
-            } else if (wakeLock != null && wakeLock.isHeld()) {
-                wakeLock.release();
-            }
+            if (isPlaying) { if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(6 * 60 * 60 * 1000L); }
+            else if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         } catch (Throwable ignored) {}
+    }
+
+    private void applyMediaSession(String title, String artist, boolean isPlaying, long position, long duration) {
+        if (mediaSession == null) return;
+        try {
+            MediaMetadataCompat.Builder meta = new MediaMetadataCompat.Builder()
+                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title != null && !title.isEmpty() ? title : "BeatStudio")
+                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist != null ? artist : "")
+                    .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration);
+            mediaSession.setMetadata(meta.build());
+
+            int state = isPlaying ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
+            PlaybackStateCompat.Builder pb = new PlaybackStateCompat.Builder()
+                    .setActions(PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE
+                            | PlaybackStateCompat.ACTION_PLAY_PAUSE | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+                            | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_STOP
+                            | PlaybackStateCompat.ACTION_SEEK_TO)
+                    .setState(state, position, isPlaying ? 1f : 0f);
+            mediaSession.setPlaybackState(pb.build());
+        } catch (Throwable t) {
+            Log.e(TAG, "session metadata/state update failed", t);
+        }
     }
 
     private Notification buildNotification(String title, String artist, boolean isPlaying) {
@@ -236,6 +530,7 @@ public class MediaControlService extends Service {
 
     @Override
     public void onDestroy() {
+        releasePlayer();
         try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Throwable ignored) {}
         try { if (mediaSession != null) mediaSession.release(); } catch (Throwable ignored) {}
         super.onDestroy();
