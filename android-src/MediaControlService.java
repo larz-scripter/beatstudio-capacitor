@@ -100,6 +100,14 @@ public class MediaControlService extends Service {
     private int pos = -1;         // index into `order`; -1 = nothing loaded
     private int repeatMode = 0;   // 0 off, 1 one, 2 all
     private boolean preparing = false;
+    // Every track failing to prepare (bad/expired auth cookie, network
+    // outage) used to cascade through onError -> handleNext() -> onError
+    // forever once repeat-all wrapped it back to track 0 - confirmed
+    // on-device as a tight loop hammering the backend at several requests
+    // per second indefinitely with nothing ever playing. Counts
+    // consecutive prepare failures across the whole queue; reset to 0 the
+    // moment any track actually prepares successfully.
+    private int consecutiveFailures = 0;
 
     private final Runnable progressTick = new Runnable() {
         @Override public void run() {
@@ -177,6 +185,7 @@ public class MediaControlService extends Service {
             // but the currently-playing track is still the same one, and
             // should keep playing uninterrupted rather than restart from 0.
             String currentUrl = currentTrackUrl();
+            consecutiveFailures = 0;
 
             queue = new JSONArray(intent.getStringExtra("queue"));
             int startTrackIndex = intent.getIntExtra("startIndex", 0);
@@ -256,6 +265,7 @@ public class MediaControlService extends Service {
             }
             player.setOnPreparedListener(mp -> {
                 preparing = false;
+                consecutiveFailures = 0;
                 try { mp.start(); } catch (Throwable ignored) {}
                 mainHandler.post(progressTick);
                 pushNotificationForCurrentTrack(true);
@@ -264,7 +274,15 @@ public class MediaControlService extends Service {
             player.setOnErrorListener((mp, what, extra) -> {
                 Log.e(TAG, "MediaPlayer error what=" + what + " extra=" + extra + " url=" + url);
                 preparing = false;
-                handleNext();
+                consecutiveFailures++;
+                int queueLen = order != null ? order.length : 1;
+                if (consecutiveFailures >= Math.max(1, queueLen)) {
+                    Log.e(TAG, "every track in the queue failed to prepare - stopping instead of looping forever");
+                    consecutiveFailures = 0;
+                    handleStop();
+                } else {
+                    handleNext();
+                }
                 return true;
             });
             player.prepareAsync();
@@ -468,6 +486,16 @@ public class MediaControlService extends Service {
         Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
         if (launch != null) {
             launch.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
+            // Tapping the notification used to just resume the app on
+            // whatever page it happened to be showing (a plain multi-page
+            // site, not an SPA, so that could be anywhere - the upload
+            // page, an artist profile, wherever navigation last left it),
+            // not the player - requested explicitly so it always lands
+            // somewhere you can switch tracks or otherwise act on what's
+            // playing. MainActivity.EXTRA_OPEN_PLAYER (see
+            // patch_mainactivity.py) forces the WebView to the playlist
+            // page when this extra is present.
+            launch.putExtra("open_player", true);
             int flags = PendingIntent.FLAG_UPDATE_CURRENT
                     | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0);
             contentIntent = PendingIntent.getActivity(this, 0, launch, flags);

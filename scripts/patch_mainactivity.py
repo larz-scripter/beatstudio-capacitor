@@ -7,6 +7,9 @@ MainActivity.java:
     service + MediaSession notification)
   - grant the WebView's own getUserMedia mic request (fallback path) without a
     second prompt once RECORD_AUDIO is held
+  - navigate straight to the player page when launched from the playback
+    notification (MediaControlService's "open_player" intent extra),
+    instead of just resuming on whatever page was last showing
 
 AndroidManifest.xml:
   - RECORD_AUDIO + MODIFY_AUDIO_SETTINGS (a Capacitor app still needs these
@@ -35,6 +38,7 @@ pkg = m.group(1)
 new = r"""package __PKG__;
 
 import android.Manifest;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -45,6 +49,7 @@ import com.getcapacitor.BridgeWebChromeClient;
 public class MainActivity extends BridgeActivity {
 
     private static final int REQ_MIC = 7731;
+    private static final String PLAYER_URL = "https://larzos.com/beatstudio/playlist/";
     private PermissionRequest pendingMicRequest;
 
     @Override
@@ -56,6 +61,7 @@ public class MainActivity extends BridgeActivity {
         // the WebView's <audio> element survives being backgrounded/screen-off.
         registerPlugin(LarzMediaPlugin.class);
         super.onCreate(savedInstanceState);
+        maybeOpenPlayer(getIntent());
 
         try {
             // If the page ever falls back to getUserMedia, grant the WebView's
@@ -99,6 +105,18 @@ public class MainActivity extends BridgeActivity {
                 else pr.deny();
             });
         }
+    }
+
+    @Override
+    public void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        maybeOpenPlayer(intent);
+    }
+
+    private void maybeOpenPlayer(Intent intent) {
+        if (intent == null || !intent.getBooleanExtra("open_player", false)) return;
+        try { getBridge().getWebView().loadUrl(PLAYER_URL); } catch (Throwable ignored) {}
     }
 }
 """.replace("__PKG__", pkg)

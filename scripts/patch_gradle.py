@@ -21,8 +21,8 @@ if os.path.isfile(V):
 P = "android/app/build.gradle"
 s = open(P).read()
 
-s = re.sub(r"versionCode\s+\d+", "versionCode 13", s, count=1)
-s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.13"', s, count=1)
+s = re.sub(r"versionCode\s+\d+", "versionCode 14", s, count=1)
+s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.14"', s, count=1)
 s = re.sub(r"minSdkVersion\s+rootProject\.ext\.minSdkVersion", "minSdkVersion 28", s, count=1)
 s = re.sub(r"minSdk\s+\d+", "minSdk 28", s, count=1)
 
@@ -52,4 +52,4 @@ s = re.sub(r"(buildTypes\s*\{\s*release\s*\{)",
            s, count=1)
 
 open(P, "w").write(s)
-print("patched android/app/build.gradle (version 12/1.12 + signing + minSdk 28)")
+print("patched android/app/build.gradle (version 14/1.14 + signing + minSdk 28)")
