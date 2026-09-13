@@ -10,7 +10,6 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.MediaPlayer;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -20,7 +19,6 @@ import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
 import android.util.Log;
-import android.webkit.CookieManager;
 
 import androidx.core.app.NotificationCompat;
 import androidx.media.app.NotificationCompat.MediaStyle;
@@ -28,11 +26,13 @@ import androidx.media.app.NotificationCompat.MediaStyle;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Foreground service that OWNS real playback via a native MediaPlayer once a
@@ -117,6 +117,18 @@ public class MediaControlService extends Service {
     // consecutive prepare failures across the whole queue; reset to 0 the
     // moment any track actually prepares successfully.
     private int consecutiveFailures = 0;
+    // One background thread for downloads - both the track actually being
+    // played and its prefetch run through it, so at most one download is
+    // ever in flight at a time (deliberately conservative: this is a
+    // background service, not a download manager, and shouldn't compete
+    // with whatever else the user's connection is doing).
+    private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
+    // Incremented on every handlePlayAt() call - lets a download that
+    // finishes after the user has already skipped past that track (next/
+    // prev tapped again before the first one even finished downloading)
+    // recognise it's stale and quietly do nothing instead of starting
+    // playback of a track that's no longer the current selection.
+    private volatile int playGeneration = 0;
 
     private final Runnable progressTick = new Runnable() {
         @Override public void run() {
@@ -167,7 +179,15 @@ public class MediaControlService extends Service {
         try {
             String action = (intent != null && intent.getAction() != null) ? intent.getAction() : ACTION_UPDATE;
 
-            if (ACTION_STOP.equals(action)) { fire(ACTION_STOP); handleStop(); return START_NOT_STICKY; }
+            // Unlike play/pause/next/prev, this used to fire ACTION_STOP
+            // back to JS unconditionally on every stop - not just when
+            // nothing was loaded - which is a redundant round trip for
+            // the same reason the other actions' unconditional fallback
+            // turned into a ping-pong loop (confirmed on-device for play/
+            // next/prev/pause this session). handleStop() already does
+            // its job regardless of what was loaded, so there's nothing
+            // for a live page to additionally handle here.
+            if (ACTION_STOP.equals(action)) { handleStop(); return START_NOT_STICKY; }
             else if (ACTION_PLAY.equals(action)) handlePlay();
             else if (ACTION_PAUSE.equals(action)) handlePause();
             else if (ACTION_NEXT.equals(action)) handleNext();
@@ -243,74 +263,149 @@ public class MediaControlService extends Service {
         return 0;
     }
 
+    /** Downloads the track to local storage first (or reuses an already-
+     *  cached copy) and only ever hands MediaPlayer a local file - never a
+     *  network URL directly. Streaming straight from the network was
+     *  confirmed on-device to be genuinely unreliable here (a CDN serving
+     *  a stale cached response at one point, a mobile connection dropping
+     *  mid-transfer at another), and for a library of hundreds of songs
+     *  that unreliability compounds every single time playback advances.
+     *  A completed local file either fully downloaded or doesn't exist -
+     *  there's no truncated/corrupt state MediaPlayer could ever see. */
     private void handlePlayAt(int newPos) {
         if (queue == null || order == null || order.length == 0) return;
         if (newPos < 0 || newPos >= order.length) return;
         pos = newPos;
+        releasePlayer();
+        final int myGeneration = ++playGeneration;
+        final String url;
         try {
             JSONObject track = queue.getJSONObject(order[pos]);
-            String url = track.optString("url", null);
+            url = track.optString("url", null);
             if (url == null || url.isEmpty()) { Log.e(TAG, "track has no url at order[" + pos + "]"); return; }
+        } catch (Throwable t) {
+            Log.e(TAG, "playAt failed reading track", t);
+            return;
+        }
+        preparing = true;
+        pushNotificationForCurrentTrack(false); // shows the title immediately while it downloads/loads
 
-            releasePlayer();
-            preparing = true;
+        bgExecutor.execute(() -> {
+            File local = null;
+            IOException err = null;
+            try {
+                local = SongCache.getOrDownload(getApplicationContext(), url);
+            } catch (IOException e) {
+                err = e;
+            } catch (Throwable t) {
+                err = new IOException(String.valueOf(t.getMessage()), t);
+            }
+            final File finalLocal = local;
+            final IOException finalErr = err;
+            mainHandler.post(() -> {
+                if (myGeneration != playGeneration) return; // superseded by a later play/next/prev - stale, drop it
+                if (finalLocal != null) startPlayerFromLocalFile(finalLocal, url);
+                else handleDownloadFailure(url, finalErr);
+            });
+        });
+    }
+
+    private void startPlayerFromLocalFile(File local, String originalUrl) {
+        try {
             player = new MediaPlayer();
             player.setAudioAttributes(new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build());
-            // BeatStudio's own recorded/mixed songs are served behind the
-            // user's logged-in session; MediaPlayer doesn't share the
-            // WebView's cookie jar automatically, so pass it explicitly or
-            // anything but the public beat catalog 401s/403s.
-            String cookie = null;
-            try { cookie = CookieManager.getInstance().getCookie(url); } catch (Throwable ignored) {}
-            if (cookie != null && !cookie.isEmpty()) {
-                Map<String, String> headers = new HashMap<>();
-                headers.put("Cookie", cookie);
-                player.setDataSource(getApplicationContext(), Uri.parse(url), headers);
-            } else {
-                player.setDataSource(url);
-            }
+            player.setDataSource(local.getAbsolutePath());
             player.setOnPreparedListener(mp -> {
                 preparing = false;
                 consecutiveFailures = 0;
                 try { mp.start(); } catch (Throwable ignored) {}
                 mainHandler.post(progressTick);
                 pushNotificationForCurrentTrack(true);
+                prefetchNext();
             });
             player.setOnCompletionListener(mp -> handleTrackCompleted());
-            final boolean hadCookie = cookie != null && !cookie.isEmpty();
             player.setOnErrorListener((mp, what, extra) -> {
-                Log.e(TAG, "MediaPlayer error what=" + what + " extra=" + extra + " url=" + url);
-                ErrorListener el = errorListener;
-                if (el != null) {
-                    try {
-                        JSONObject err = new JSONObject();
-                        err.put("what", what);
-                        err.put("extra", extra);
-                        err.put("url", url);
-                        err.put("hadCookie", hadCookie);
-                        el.onPlaybackError(err);
-                    } catch (Throwable ignored) {}
-                }
+                // A LOCAL file failing to play (as opposed to failing to
+                // download) points at something other than network
+                // flakiness - genuinely corrupt/unsupported audio, most
+                // likely - but is otherwise handled exactly the same way.
+                Log.e(TAG, "MediaPlayer error (local file) what=" + what + " extra=" + extra + " url=" + originalUrl);
+                reportPlaybackError(what, extra, originalUrl, true);
                 preparing = false;
-                consecutiveFailures++;
-                int queueLen = order != null ? order.length : 1;
-                if (consecutiveFailures >= Math.max(1, queueLen)) {
-                    Log.e(TAG, "every track in the queue failed to prepare - stopping instead of looping forever");
-                    consecutiveFailures = 0;
-                    handleStop();
-                } else {
-                    handleNext();
-                }
+                handlePlaybackFailure();
                 return true;
             });
             player.prepareAsync();
-            pushNotificationForCurrentTrack(false); // shows the title immediately while it loads
         } catch (Throwable t) {
-            Log.e(TAG, "playAt failed", t);
+            Log.e(TAG, "startPlayerFromLocalFile failed", t);
+            preparing = false;
+            handlePlaybackFailure();
         }
+    }
+
+    private void handleDownloadFailure(String url, IOException err) {
+        Log.e(TAG, "download failed for " + url, err);
+        reportPlaybackError(-1, 0, url, false);
+        preparing = false;
+        handlePlaybackFailure();
+    }
+
+    private void reportPlaybackError(int what, int extra, String url, boolean hadCookie) {
+        ErrorListener el = errorListener;
+        if (el == null) return;
+        try {
+            JSONObject err = new JSONObject();
+            err.put("what", what);
+            err.put("extra", extra);
+            err.put("url", url);
+            err.put("hadCookie", hadCookie);
+            el.onPlaybackError(err);
+        } catch (Throwable ignored) {}
+    }
+
+    /** Shared by a failed download and a failed local-file prepare -
+     *  advances to the next track, same as the loop-guard already did for
+     *  streaming failures, so one bad file doesn't stop a whole "play all"
+     *  session. Still stops cleanly instead of looping once every track in
+     *  the queue has failed once (confirmed on-device this session: without
+     *  this cap, a bad connection plus repeat-all cascaded into thousands
+     *  of retries a minute). */
+    private void handlePlaybackFailure() {
+        consecutiveFailures++;
+        int queueLen = order != null ? order.length : 1;
+        if (consecutiveFailures >= Math.max(1, queueLen)) {
+            Log.e(TAG, "every track in the queue failed to play - stopping instead of looping forever");
+            consecutiveFailures = 0;
+            handleStop();
+        } else {
+            handleNext();
+        }
+    }
+
+    /** Downloads the NEXT track in the background while the current one is
+     *  still playing, so by the time playback naturally advances (or the
+     *  user taps next) it's already sitting in local storage and starts
+     *  instantly - the actual point of caching at all for a "play all"
+     *  session across a large library, not just papering over one bad
+     *  request. Silently skips whatever's already cached. */
+    private void prefetchNext() {
+        if (queue == null || order == null || order.length == 0) return;
+        int nextIdx = pos + 1;
+        if (nextIdx >= order.length) {
+            if (repeatMode == 2) nextIdx = 0; else return;
+        }
+        try {
+            String nextUrl = queue.getJSONObject(order[nextIdx]).optString("url", null);
+            if (nextUrl == null || nextUrl.isEmpty()) return;
+            if (SongCache.isCached(getApplicationContext(), nextUrl)) return;
+            bgExecutor.execute(() -> {
+                try { SongCache.getOrDownload(getApplicationContext(), nextUrl); }
+                catch (Throwable t) { Log.w(TAG, "prefetch failed for " + nextUrl + " - will retry when actually needed"); }
+            });
+        } catch (Throwable ignored) {}
     }
 
     private void handleTrackCompleted() {
@@ -580,6 +675,7 @@ public class MediaControlService extends Service {
     @Override
     public void onDestroy() {
         releasePlayer();
+        try { bgExecutor.shutdownNow(); } catch (Throwable ignored) {}
         try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Throwable ignored) {}
         try { if (mediaSession != null) mediaSession.release(); } catch (Throwable ignored) {}
         super.onDestroy();
