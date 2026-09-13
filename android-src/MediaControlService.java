@@ -83,6 +83,15 @@ public class MediaControlService extends Service {
     private static volatile StateListener stateListener;
     public static void setStateListener(StateListener l) { stateListener = l; }
 
+    /** Fired whenever MediaPlayer itself fails to prepare a track - the
+     *  `what`/`extra` codes are otherwise only visible in device logcat,
+     *  which isn't reachable when debugging a report remotely. Exposing
+     *  them here let a single JS-side debug beacon answer "why did it
+     *  fail" without ever needing physical/adb access to the device. */
+    public interface ErrorListener { void onPlaybackError(JSONObject error); }
+    private static volatile ErrorListener errorListener;
+    public static void setErrorListener(ErrorListener l) { errorListener = l; }
+
     /** Last broadcast snapshot, so LarzMediaPlugin.getState() can answer
      *  synchronously (a freshly-loaded page's first render) without waiting
      *  for the next tick. */
@@ -271,8 +280,20 @@ public class MediaControlService extends Service {
                 pushNotificationForCurrentTrack(true);
             });
             player.setOnCompletionListener(mp -> handleTrackCompleted());
+            final boolean hadCookie = cookie != null && !cookie.isEmpty();
             player.setOnErrorListener((mp, what, extra) -> {
                 Log.e(TAG, "MediaPlayer error what=" + what + " extra=" + extra + " url=" + url);
+                ErrorListener el = errorListener;
+                if (el != null) {
+                    try {
+                        JSONObject err = new JSONObject();
+                        err.put("what", what);
+                        err.put("extra", extra);
+                        err.put("url", url);
+                        err.put("hadCookie", hadCookie);
+                        el.onPlaybackError(err);
+                    } catch (Throwable ignored) {}
+                }
                 preparing = false;
                 consecutiveFailures++;
                 int queueLen = order != null ? order.length : 1;
