@@ -66,6 +66,7 @@ public class MediaControlService extends Service {
     public static final String ACTION_LOAD_QUEUE = "com.larzos.beatstudio.action.LOAD_QUEUE";
     public static final String ACTION_PLAY_AT = "com.larzos.beatstudio.action.PLAY_AT";
     public static final String ACTION_SEEK = "com.larzos.beatstudio.action.SEEK";
+    public static final String ACTION_SET_REPEAT = "com.larzos.beatstudio.action.SET_REPEAT";
 
     /** Fired for a transport button tap that this service can't fully
      *  handle itself (nothing loaded natively yet) - lets a page that
@@ -157,6 +158,7 @@ public class MediaControlService extends Service {
             else if (ACTION_LOAD_QUEUE.equals(action)) handleLoadQueue(intent);
             else if (ACTION_PLAY_AT.equals(action)) handlePlayAt(indexOfTrack(intent.getIntExtra("index", 0)));
             else if (ACTION_SEEK.equals(action)) handleSeek(intent.getLongExtra("positionMs", 0));
+            else if (ACTION_SET_REPEAT.equals(action)) repeatMode = intent.getIntExtra("repeat", repeatMode);
             else if (intent != null && intent.hasExtra("title")) applyState(intent);
         } catch (Throwable t) {
             Log.e(TAG, "onStartCommand failed - stopping self, background playback unavailable this session", t);
@@ -170,15 +172,36 @@ public class MediaControlService extends Service {
 
     private void handleLoadQueue(Intent intent) {
         try {
+            // Captured from the OLD queue/order before we overwrite them -
+            // e.g. toggling shuffle mid-song sends a whole new queue+order
+            // but the currently-playing track is still the same one, and
+            // should keep playing uninterrupted rather than restart from 0.
+            String currentUrl = currentTrackUrl();
+
             queue = new JSONArray(intent.getStringExtra("queue"));
             int startTrackIndex = intent.getIntExtra("startIndex", 0);
             repeatMode = intent.getIntExtra("repeat", 0);
             boolean shuffle = intent.getBooleanExtra("shuffle", false);
             buildOrder(shuffle, startTrackIndex);
-            handlePlayAt(indexOfTrack(startTrackIndex));
+            int newPos = indexOfTrack(startTrackIndex);
+
+            String targetUrl = null;
+            try { targetUrl = queue.getJSONObject(order[newPos]).optString("url", null); } catch (Throwable ignored) {}
+
+            if (player != null && !preparing && targetUrl != null && targetUrl.equals(currentUrl)) {
+                pos = newPos;
+                pushNotificationForCurrentTrack(isPlayingSafe());
+            } else {
+                handlePlayAt(newPos);
+            }
         } catch (Throwable t) {
             Log.e(TAG, "loadQueue failed", t);
         }
+    }
+
+    private String currentTrackUrl() {
+        if (queue == null || order == null || pos < 0 || pos >= order.length) return null;
+        try { return queue.getJSONObject(order[pos]).optString("url", null); } catch (Throwable t) { return null; }
     }
 
     private void buildOrder(boolean shuffle, int startTrackIndex) {
@@ -359,6 +382,14 @@ public class MediaControlService extends Service {
             JSONObject track = queue.getJSONObject(order[pos]);
             JSONObject state = new JSONObject();
             state.put("trackIndex", order[pos]);
+            // The one field a page should actually key off of: JS always
+            // sends shuffle:false and pre-orders the queue itself, so
+            // trackIndex/queuePos are positions in whatever order THIS
+            // playback session was loaded with - meaningless to a page that
+            // just loaded fresh and built its own (possibly differently
+            // shuffled) order[]. Matching on the URL instead needs no
+            // shared position scheme at all.
+            state.put("url", track.optString("url", ""));
             state.put("title", track.optString("title", ""));
             state.put("artist", track.optString("artist", ""));
             state.put("isPlaying", isPlayingSafe());

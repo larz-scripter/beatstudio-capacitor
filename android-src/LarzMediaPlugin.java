@@ -134,6 +134,15 @@ public class LarzMediaPlugin extends Plugin {
         call.resolve();
     }
 
+    /** Changes repeat mode in place - unlike loadQueue(), does not touch or
+     *  restart whatever's currently playing. */
+    @PluginMethod
+    public void setRepeat(PluginCall call) {
+        final int repeat = call.getInt("repeat", 0);
+        sendAction(MediaControlService.ACTION_SET_REPEAT, i -> i.putExtra("repeat", repeat));
+        call.resolve();
+    }
+
     @PluginMethod
     public void getState(PluginCall call) {
         try {
