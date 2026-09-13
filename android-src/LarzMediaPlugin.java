@@ -42,6 +42,9 @@ import com.getcapacitor.annotation.PermissionCallback;
  *      loaded natively yet, so a live page needs to handle it the old way.
  *   'state' { ...same shape as getState() } - fires on every native playback
  *      state change, so a page that's currently open can sync its own UI.
+ *   'error' { what, extra, url, hadCookie } - MediaPlayer failed to prepare
+ *      a track; the what/extra codes match MediaPlayer.OnErrorListener's
+ *      documented values and are otherwise only visible in device logcat.
  */
 @CapacitorPlugin(
         name = "LarzMedia",
@@ -61,6 +64,9 @@ public class LarzMediaPlugin extends Plugin {
         });
         MediaControlService.setStateListener(state -> {
             try { notifyListeners("state", JSObject.fromJSONObject(state)); } catch (Throwable ignored) {}
+        });
+        MediaControlService.setErrorListener(error -> {
+            try { notifyListeners("error", JSObject.fromJSONObject(error)); } catch (Throwable ignored) {}
         });
     }
 
