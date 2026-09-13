@@ -21,8 +21,8 @@ if os.path.isfile(V):
 P = "android/app/build.gradle"
 s = open(P).read()
 
-s = re.sub(r"versionCode\s+\d+", "versionCode 12", s, count=1)
-s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.12"', s, count=1)
+s = re.sub(r"versionCode\s+\d+", "versionCode 13", s, count=1)
+s = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.13"', s, count=1)
 s = re.sub(r"minSdkVersion\s+rootProject\.ext\.minSdkVersion", "minSdkVersion 28", s, count=1)
 s = re.sub(r"minSdk\s+\d+", "minSdk 28", s, count=1)
 
