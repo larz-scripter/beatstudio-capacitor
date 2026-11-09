@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BeatStudio — can't connect</title>
+<style>
+  :root{--bg:#0b0f1a;--fg:#e8edf5;--dim:#8b98a9;--accent:#00c896;--line:#26303d}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--fg);
+       font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+       display:flex;align-items:center;justify-content:center;
+       padding:24px;padding-top:calc(24px + env(safe-area-inset-top));
+       padding-bottom:calc(24px + env(safe-area-inset-bottom));box-sizing:border-box}
+  .card{width:100%;max-width:30rem}
+  .logo{font-size:1.7rem;font-weight:800;letter-spacing:-.02em;margin-bottom:.1rem}
+  .logo b{color:var(--accent)}
+  h1{font-size:1.1rem;margin:1.2rem 0 .5rem}
+  p{color:var(--dim);line-height:1.55;margin:.5rem 0}
+  button{width:100%;margin-top:1.3rem;padding:.9rem 1rem;font:inherit;font-weight:700;
+         color:#04120d;background:var(--accent);border:0;border-radius:.6rem}
+  button:active{opacity:.85}
+  details{margin-top:1.3rem;border-top:1px solid var(--line);padding-top:1rem}
+  summary{color:var(--fg);font-weight:600;cursor:pointer}
+  ol{color:var(--dim);line-height:1.6;padding-left:1.2rem}
+  code{background:#141b28;border:1px solid var(--line);border-radius:.3rem;
+       padding:.1rem .35rem;color:var(--fg);font-size:.92em}
+  .state{margin-top:1rem;font-size:.85rem;color:var(--dim);min-height:1.2em}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">Beat<b>Studio</b></div>
+    <h1>Can’t reach larzos.com</h1>
+    <p>The studio itself is almost certainly fine — this device just can’t open a
+       connection to it. It is usually the network you are on, not the app.</p>
+    <button id="retry">Try again</button>
+    <div class="state" id="state"></div>
+
+    <details>
+      <summary>If it keeps failing on this network</summary>
+      <p>Some mobile carriers drop traffic to certain Cloudflare addresses. When
+         that happens the site answers normally for everyone else while this
+         phone times out. Changing the phone’s DNS fixes it:</p>
+      <ol>
+        <li>Android <b>Settings → Network &amp; internet → Private DNS</b></li>
+        <li>Choose <b>Private DNS provider hostname</b></li>
+        <li>Enter <code>dns.google</code> &nbsp;(or <code>dns.quad9.net</code>)</li>
+        <li>Save, then reopen BeatStudio</li>
+      </ol>
+      <p>Do not set it to <code>one.one.one.one</code> — that resolver is the one
+         that hands out the unreachable addresses.</p>
+      <p>Mobile data and Wi-Fi can behave differently, so trying the other one is
+         also worth a go.</p>
+    </details>
+  </div>
+
+<script>
+// server.url is the live site; this page is only ever shown when loading it
+// failed. Probe before navigating so a retry that cannot possibly work does
+// not just bounce the user back here with no explanation.
+(function () {
+  var HOME = "https://larzos.com/beatstudio/";
+  var btn = document.getElementById("retry");
+  var state = document.getElementById("state");
+  var busy = false;
+
+  function go() { location.replace(HOME); }
+
+  btn.addEventListener("click", function () {
+    if (busy) return;
+    busy = true;
+    btn.textContent = "Checking…";
+    state.textContent = "";
+    var done = false;
+    var t = setTimeout(function () {
+      if (done) return;
+      done = true;
+      busy = false;
+      btn.textContent = "Try again";
+      state.textContent = "Still no connection. Try the DNS steps below.";
+    }, 8000);
+    // A cache-busted HEAD-ish probe. no-store so a previous failure is never
+    // replayed from cache; no-cors because we only care that it resolves and
+    // connects, not what it returns.
+    fetch(HOME + "?probe=" + Date.now(), { mode: "no-cors", cache: "no-store" })
+      .then(function () { if (!done) { done = true; clearTimeout(t); go(); } })
+      .catch(function () {
+        if (done) return;
+        done = true; clearTimeout(t); busy = false;
+        btn.textContent = "Try again";
+        state.textContent = "Still no connection. Try the DNS steps below.";
+      });
+  });
+
+  // Coming back online is the common case after switching Wi-Fi/data.
+  window.addEventListener("online", go);
+})();
+</script>
+</body>
+</html>
