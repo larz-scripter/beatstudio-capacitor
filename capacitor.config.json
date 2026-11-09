@@ -4,13 +4,14 @@
   "webDir": "www",
   "appendUserAgent": "BeatStudioApp",
   "server": {
-    "url": "https://larzos.com/beatstudio/",
+    "url": "https://app.larzos.com/beatstudio/",
     "androidScheme": "https",
     "cleartext": false,
     "allowNavigation": [
       "larzos.com",
       "*.larzos.com"
-    ]
+    ],
+    "errorPath": "error.html"
   },
   "android": {
     "backgroundColor": "#0b0f1a",
